@@ -177,7 +177,41 @@ func main() {
 		}
 
 		fmt.Println(string(jsonOutput))
+	case "info":
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "Usage: ./runner.sh info <torrent_file>")
+			os.Exit(1)
+		}
 
+		data, err := os.ReadFile(os.Args[2])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+
+		decoded, err := decodeBencode(string(data))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+
+		mapOutput, ok := decoded.(map[string]interface{})
+		if !ok {
+			fmt.Fprintln(os.Stderr, "Error: decoded value is not a map")
+			os.Exit(1)
+		}
+		announce, announceOk := mapOutput["announce"].(string)
+		if !announceOk {
+			fmt.Fprintln(os.Stderr, "Error: announce not found in decoded value")
+			os.Exit(1)
+		}
+		length,lengthOk:=mapOutput["info"].(map[string]interface{})["length"].(int)
+		if !lengthOk {
+			fmt.Fprintln(os.Stderr, "Error: length not found in decoded value")
+			os.Exit(1)
+		}
+		fmt.Println("Tracker URL:",announce)
+		fmt.Println("Length:",length)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", command)
 		os.Exit(1)
