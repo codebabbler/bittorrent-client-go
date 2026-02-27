@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -84,36 +86,40 @@ func decodeList(input string, pos *int) ([]interface{}, error) {
 	return nil, fmt.Errorf("invalid bencoded list: missing terminating 'e'")
 }
 
-func decodeDict(input string, pos *int) (map[string]interface{}, error) {
+// decodeDict returns the parsed map and a map of raw bencoded bytes per key
+func decodeDict(input string, pos *int) (map[string]interface{}, map[string]string, error) {
 	(*pos)++ // skip 'd'
 
 	result := make(map[string]interface{})
+	rawValues := make(map[string]string)
 
 	for *pos < len(input) {
 		if input[*pos] == 'e' {
 			(*pos)++ // consume 'e'
-			return result, nil
+			return result, rawValues, nil
 		}
 
 		// Keys must always be strings in bencode
 		if !unicode.IsDigit(rune(input[*pos])) {
-			return nil, fmt.Errorf("invalid bencoded dict: key must be a string")
+			return nil, nil, fmt.Errorf("invalid bencoded dict: key must be a string")
 		}
 
 		key, err := decodeString(input, pos)
 		if err != nil {
-			return nil, fmt.Errorf("invalid bencoded dict key: %w", err)
+			return nil, nil, fmt.Errorf("invalid bencoded dict key: %w", err)
 		}
 
+		startPos := *pos
 		value, err := decode(input, pos)
 		if err != nil {
-			return nil, fmt.Errorf("invalid bencoded dict value for key %q: %w", key, err)
+			return nil, nil, fmt.Errorf("invalid bencoded dict value for key %q: %w", key, err)
 		}
 
 		result[key] = value
+		rawValues[key] = input[startPos:*pos]
 	}
 
-	return nil, fmt.Errorf("invalid bencoded dict: missing terminating 'e'")
+	return nil, nil, fmt.Errorf("invalid bencoded dict: missing terminating 'e'")
 }
 
 // Example:
@@ -141,11 +147,14 @@ func decode(input string, pos *int) (interface{}, error) {
 	case char == 'l':
 		return decodeList(input, pos)
 	case char == 'd':
-		return decodeDict(input, pos)
+		dict, _, err := decodeDict(input, pos)
+		return dict, err
 	default:
 		return "", fmt.Errorf("unsupported bencode type: %q", char)
 	}
 }
+
+
 
 func main() {
 	fmt.Fprintln(os.Stderr, "Logs from your program will appear here!")
@@ -189,29 +198,44 @@ func main() {
 			os.Exit(1)
 		}
 
-		decoded, err := decodeBencode(string(data))
+		dataStr := string(data)
+		if len(dataStr) == 0 || dataStr[0] != 'd' {
+			fmt.Fprintln(os.Stderr, "Error: torrent file is not a bencoded dictionary")
+			os.Exit(1)
+		}
+
+		// Decode the top-level dict, getting both parsed values and raw bytes in one pass
+		pos := 0
+		torrent, rawValues, err := decodeDict(dataStr, &pos)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
 			os.Exit(1)
 		}
 
-		mapOutput, ok := decoded.(map[string]interface{})
-		if !ok {
-			fmt.Fprintln(os.Stderr, "Error: decoded value is not a map")
-			os.Exit(1)
-		}
-		announce, announceOk := mapOutput["announce"].(string)
+		announce, announceOk := torrent["announce"].(string)
 		if !announceOk {
-			fmt.Fprintln(os.Stderr, "Error: announce not found in decoded value")
+			fmt.Fprintln(os.Stderr, "Error: announce not found")
 			os.Exit(1)
 		}
-		length,lengthOk:=mapOutput["info"].(map[string]interface{})["length"].(int)
+
+		info, infoOk := torrent["info"].(map[string]interface{})
+		if !infoOk {
+			fmt.Fprintln(os.Stderr, "Error: info not found")
+			os.Exit(1)
+		}
+
+		// Raw bytes captured during decode — no re-encoding needed
+		infoHash := sha1.Sum([]byte(rawValues["info"]))
+
+		length, lengthOk := info["length"].(int)
 		if !lengthOk {
-			fmt.Fprintln(os.Stderr, "Error: length not found in decoded value")
+			fmt.Fprintln(os.Stderr, "Error: length not found")
 			os.Exit(1)
 		}
-		fmt.Println("Tracker URL:",announce)
-		fmt.Println("Length:",length)
+
+		fmt.Println("Tracker URL:", announce)
+		fmt.Println("Length:", length)
+		fmt.Println("Info Hash:", hex.EncodeToString(infoHash[:]))
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", command)
 		os.Exit(1)
