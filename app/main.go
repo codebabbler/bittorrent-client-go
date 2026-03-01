@@ -285,7 +285,7 @@ func main() {
 
 	case "peers":
 		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "Usage: ./your_program.sh peers <torrent_file>")
+			fmt.Fprintln(os.Stderr, "Usage: ./runner.sh peers <torrent_file>")
 			os.Exit(1)
 		}
 
