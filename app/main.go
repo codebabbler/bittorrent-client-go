@@ -232,10 +232,26 @@ func main() {
 			fmt.Fprintln(os.Stderr, "Error: length not found")
 			os.Exit(1)
 		}
+		
+		piecesStr, piecesOk := info["pieces"].(string)
+		if !piecesOk {
+			fmt.Fprintln(os.Stderr, "Error: pieces not found")
+			os.Exit(1)
+		}
 
 		fmt.Println("Tracker URL:", announce)
 		fmt.Println("Length:", length)
+		fmt.Println("Piece Length:", info["piece length"])
 		fmt.Println("Info Hash:", hex.EncodeToString(infoHash[:]))
+
+		fmt.Println("Piece Hashes:")
+		for i := 0; i < len(piecesStr); i += 20 {
+			end := i + 20
+			if end > len(piecesStr) {
+				end = len(piecesStr)
+			}
+			fmt.Println(hex.EncodeToString([]byte(piecesStr[i:end])))
+		}
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", command)
 		os.Exit(1)
