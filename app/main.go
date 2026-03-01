@@ -2,9 +2,14 @@ package main
 
 import (
 	"crypto/sha1"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"unicode"
@@ -154,7 +159,31 @@ func decode(input string, pos *int) (interface{}, error) {
 	}
 }
 
+func getRequestToTracker(trackerUrl string, 
+							infoHash string, 
+							peerId string, 
+							port int, 
+							uploaded int, 
+							downloaded int, 
+							left int) (*http.Response,error) {
+	baseUrl := trackerUrl
+	params := url.Values{}
+	params.Set("info_hash", infoHash)
+	params.Set("peer_id", peerId)
+	params.Set("port", strconv.Itoa(port))
+	params.Set("uploaded", strconv.Itoa(uploaded))
+	params.Set("downloaded", strconv.Itoa(downloaded))
+	params.Set("left", strconv.Itoa(left))
+	params.Set("compact", strconv.Itoa(1))
+	resp, err := http.Get(baseUrl + "?" + params.Encode())
+	if err != nil {
+		return nil, err
+	}
+	// Note: caller is responsible for closing resp.Body
 
+	
+	return resp, nil
+}
 
 func main() {
 	fmt.Fprintln(os.Stderr, "Logs from your program will appear here!")
@@ -232,12 +261,13 @@ func main() {
 			fmt.Fprintln(os.Stderr, "Error: length not found")
 			os.Exit(1)
 		}
-		
+
 		piecesStr, piecesOk := info["pieces"].(string)
 		if !piecesOk {
 			fmt.Fprintln(os.Stderr, "Error: pieces not found")
 			os.Exit(1)
 		}
+
 
 		fmt.Println("Tracker URL:", announce)
 		fmt.Println("Length:", length)
@@ -252,6 +282,76 @@ func main() {
 			}
 			fmt.Println(hex.EncodeToString([]byte(piecesStr[i:end])))
 		}
+
+	case "peers":
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "Usage: ./your_program.sh peers <torrent_file>")
+			os.Exit(1)
+		}
+
+		data, err := os.ReadFile(os.Args[2])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+
+		dataStr := string(data)
+		if len(dataStr) == 0 || dataStr[0] != 'd' {
+			fmt.Fprintln(os.Stderr, "Error: torrent file is not a bencoded dictionary")
+			os.Exit(1)
+		}
+
+		pos := 0
+		torrent, rawValues, err := decodeDict(dataStr, &pos)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+
+		announce, announceOk := torrent["announce"].(string)
+		if !announceOk {
+			fmt.Fprintln(os.Stderr, "Error: announce not found")
+			os.Exit(1)
+		}
+
+		info, infoOk := torrent["info"].(map[string]interface{})
+		if !infoOk {
+			fmt.Fprintln(os.Stderr, "Error: info not found")
+			os.Exit(1)
+		}
+
+		infoHash := sha1.Sum([]byte(rawValues["info"]))
+
+		length, lengthOk := info["length"].(int)
+		if !lengthOk {
+			fmt.Fprintln(os.Stderr, "Error: length not found")
+			os.Exit(1)
+		}
+
+		resp, err := getRequestToTracker(announce, string(infoHash[:]), "qwertyuiopqazwsxedcr", 6881, 0, 0, length)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+
+		bodyBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+		decoded, err := decodeBencode(string(bodyBytes))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+		peers := decoded.(map[string]interface{})["peers"].(string)
+		for i := 0; i < len(peers); i += 6 {
+			ip := net.IP(peers[i : i+4])
+			port := binary.BigEndian.Uint16([]byte(peers[i+4 : i+6]))
+			fmt.Printf("%s:%d\n", ip, port)
+		}
+
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", command)
 		os.Exit(1)
