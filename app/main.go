@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/rand"
 	"crypto/sha1"
 	"encoding/binary"
 	"encoding/hex"
@@ -328,7 +329,7 @@ func main() {
 			os.Exit(1)
 		}
 
-		resp, err := getRequestToTracker(announce, string(infoHash[:]), "qwertyuiopqazwsxedcr", 6881, 0, 0, length)
+		resp, err := getRequestToTracker(announce, string(infoHash[:]), "-MT1230-rT6yUi8OpLkJ", 6881, 0, 0, length)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
 			os.Exit(1)
@@ -351,6 +352,74 @@ func main() {
 			port := binary.BigEndian.Uint16([]byte(peers[i+4 : i+6]))
 			fmt.Printf("%s:%d\n", ip, port)
 		}
+
+	case "handshake":
+		if len(os.Args) < 4 {
+			fmt.Fprintln(os.Stderr, "Usage: ./runner.sh handshake <torrent_file> <peer_address>")
+			os.Exit(1)
+		}
+
+		torrentFile := os.Args[2]
+		peerAddress := os.Args[3]
+
+		data, err := os.ReadFile(torrentFile)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+
+		dataStr := string(data)
+		pos := 0
+		_, rawValues, err := decodeDict(dataStr, &pos)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+
+		infoHash := sha1.Sum([]byte(rawValues["info"]))
+
+		// Connect to peer
+		conn, err := net.Dial("tcp", peerAddress)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error connecting:", err)
+			os.Exit(1)
+		}
+		defer conn.Close()
+
+		// Build 68-byte handshake
+		var handshake [68]byte
+		handshake[0] = 19
+		copy(handshake[1:20], []byte("BitTorrent protocol"))
+
+		// reserved bytes [20-28] are already zero
+		copy(handshake[28:48], infoHash[:])
+
+		var peerId [20]byte
+		_, err = rand.Read(peerId[:])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error generating peer ID:", err)
+			os.Exit(1)
+		}
+		copy(handshake[48:68], peerId[:])
+
+		// Send handshake
+		_, err = conn.Write(handshake[:])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error sending handshake:", err)
+			os.Exit(1)
+		}
+
+		// Receive handshake
+		var response [68]byte
+		_, err = io.ReadFull(conn, response[:])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error reading handshake:", err)
+			os.Exit(1)
+		}
+
+		// Print peer ID (last 20 bytes)
+		receivedPeerId := response[48:68]
+		fmt.Println("Peer ID:", hex.EncodeToString(receivedPeerId))
 
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", command)
