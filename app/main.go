@@ -421,6 +421,223 @@ func main() {
 		receivedPeerId := response[48:68]
 		fmt.Println("Peer ID:", hex.EncodeToString(receivedPeerId))
 
+	case "download_piece":
+		if len(os.Args) < 6 || os.Args[2] != "-o" {
+			fmt.Fprintln(os.Stderr, "Usage: ./runner.sh download_piece -o <output_file> <torrent_file> <piece_index>")
+			os.Exit(1)
+		}
+
+		outputPath := os.Args[3]
+		torrentFile := os.Args[4]
+		pieceIndex, err := strconv.Atoi(os.Args[5])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error: invalid piece index")
+			os.Exit(1)
+		}
+
+		// Parse torrent file
+		data, err := os.ReadFile(torrentFile)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+
+		dataStr := string(data)
+		pos := 0
+		torrent, rawValues, err := decodeDict(dataStr, &pos)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+
+		announce := torrent["announce"].(string)
+		info := torrent["info"].(map[string]interface{})
+		infoHash := sha1.Sum([]byte(rawValues["info"]))
+		totalLength := info["length"].(int)
+		normalPieceLength := info["piece length"].(int)
+		piecesStr := info["pieces"].(string)
+
+		// Calculate this piece's actual size (last piece may be smaller)
+		pieceLength := normalPieceLength
+		totalPieces := (totalLength + normalPieceLength - 1) / normalPieceLength
+		if pieceIndex == totalPieces-1 {
+			pieceLength = totalLength - (pieceIndex * normalPieceLength)
+		}
+
+		// Get peers from tracker
+		resp, err := getRequestToTracker(announce, string(infoHash[:]), "-MT1230-rT6yUi8OpLkJ", 6881, 0, 0, totalLength)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+		bodyBytes, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+		decoded, err := decodeBencode(string(bodyBytes))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+		peersStr := decoded.(map[string]interface{})["peers"].(string)
+		peerIP := net.IP(peersStr[0:4])
+		peerPort := binary.BigEndian.Uint16([]byte(peersStr[4:6]))
+		peerAddress := net.JoinHostPort(peerIP.String(), strconv.Itoa(int(peerPort)))
+
+		// TCP connection & handshake
+		conn, err := net.Dial("tcp", peerAddress)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error connecting:", err)
+			os.Exit(1)
+		}
+		defer conn.Close()
+
+		var handshake [68]byte
+		handshake[0] = 19
+		copy(handshake[1:20], []byte("BitTorrent protocol"))
+		copy(handshake[28:48], infoHash[:])
+		var peerId [20]byte
+		_, err = rand.Read(peerId[:])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+		copy(handshake[48:68], peerId[:])
+
+		_, err = conn.Write(handshake[:])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error sending handshake:", err)
+			os.Exit(1)
+		}
+
+		var handshakeResp [68]byte
+		_, err = io.ReadFull(conn, handshakeResp[:])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error reading handshake:", err)
+			os.Exit(1)
+		}
+
+		// Receive bitfield (message ID = 5)
+		lengthBuf := make([]byte, 4)
+		_, err = io.ReadFull(conn, lengthBuf)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error reading bitfield length:", err)
+			os.Exit(1)
+		}
+		msgLen := binary.BigEndian.Uint32(lengthBuf)
+		if msgLen > 0 {
+			msgBuf := make([]byte, msgLen)
+			_, err = io.ReadFull(conn, msgBuf)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error reading bitfield:", err)
+				os.Exit(1)
+			}
+			// msgBuf[0] should be 5 (bitfield), ignore payload
+		}
+
+		// Send interested (message ID = 2)
+		interested := make([]byte, 5)
+		binary.BigEndian.PutUint32(interested[0:4], 1) // length = 1
+		interested[4] = 2                               // message ID
+		_, err = conn.Write(interested)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error sending interested:", err)
+			os.Exit(1)
+		}
+
+		// Wait for unchoke (message ID = 1)
+		for {
+			_, err = io.ReadFull(conn, lengthBuf)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error waiting for unchoke:", err)
+				os.Exit(1)
+			}
+			msgLen = binary.BigEndian.Uint32(lengthBuf)
+			if msgLen == 0 {
+				continue // keepalive
+			}
+			msgBuf := make([]byte, msgLen)
+			_, err = io.ReadFull(conn, msgBuf)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error reading unchoke:", err)
+				os.Exit(1)
+			}
+			if msgBuf[0] == 1 { // unchoke
+				break
+			}
+		}
+
+		// Request blocks and receive piece data
+		blockSize := 16384 // 16 KiB
+		pieceData := make([]byte, pieceLength)
+		totalBlocks := (pieceLength + blockSize - 1) / blockSize
+
+		for i := 0; i < totalBlocks; i++ {
+			offset := i * blockSize
+			length := blockSize
+			if offset+length > pieceLength {
+				length = pieceLength - offset
+			}
+
+			// Send request (message ID = 6, payload = 12 bytes)
+			request := make([]byte, 17)
+			binary.BigEndian.PutUint32(request[0:4], 13) // length = 13
+			request[4] = 6                                // message ID = request
+			binary.BigEndian.PutUint32(request[5:9], uint32(pieceIndex))
+			binary.BigEndian.PutUint32(request[9:13], uint32(offset))
+			binary.BigEndian.PutUint32(request[13:17], uint32(length))
+			_, err = conn.Write(request)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error sending request:", err)
+				os.Exit(1)
+			}
+		}
+
+		// Receive all blocks
+		blocksReceived := 0
+		for blocksReceived < totalBlocks {
+			_, err = io.ReadFull(conn, lengthBuf)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error reading piece length:", err)
+				os.Exit(1)
+			}
+			msgLen = binary.BigEndian.Uint32(lengthBuf)
+			if msgLen == 0 {
+				continue // keepalive
+			}
+			msgBuf := make([]byte, msgLen)
+			_, err = io.ReadFull(conn, msgBuf)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error reading piece:", err)
+				os.Exit(1)
+			}
+			if msgBuf[0] != 7 { // not a piece message
+				continue
+			}
+			begin := binary.BigEndian.Uint32(msgBuf[5:9])
+			block := msgBuf[9:]
+			copy(pieceData[begin:], block)
+			blocksReceived++
+		}
+
+		// Verify piece hash
+		expectedHash := piecesStr[pieceIndex*20 : (pieceIndex+1)*20]
+		actualHash := sha1.Sum(pieceData)
+		if string(actualHash[:]) != expectedHash {
+			fmt.Fprintln(os.Stderr, "Error: piece hash mismatch")
+			os.Exit(1)
+		}
+
+		// Save to disk
+		err = os.WriteFile(outputPath, pieceData, 0644)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error writing file:", err)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "Piece %d downloaded to %s.\n", pieceIndex, outputPath)
+
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", command)
 		os.Exit(1)
