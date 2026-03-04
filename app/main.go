@@ -882,6 +882,110 @@ func main() {
 		fmt.Println("Tracker URL:", trackerUrl)
 		fmt.Println("Info Hash:", infoHash)
 
+	case "magnet_handshake":
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "Usage: ./your_program.sh magnet_handshake <magnet-link>")
+			os.Exit(1)
+		}
+
+		magnetLink := os.Args[2]
+
+		// Parse magnet link
+		parsedUrl, err := url.Parse(magnetLink)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error parsing magnet link:", err)
+			os.Exit(1)
+		}
+
+		xt := parsedUrl.Query().Get("xt")
+		infoHashHex := xt[len("urn:btih:"):]
+		trackerUrl := parsedUrl.Query().Get("tr")
+
+		// Decode hex info hash to raw bytes
+		infoHash, err := hex.DecodeString(infoHashHex)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error decoding info hash:", err)
+			os.Exit(1)
+		}
+
+		if trackerUrl == "" {
+			fmt.Fprintln(os.Stderr, "Error: magnet link has no tracker URL (tr parameter)")
+			os.Exit(1)
+		}
+
+		// Get peers from tracker
+		resp, err := getRequestToTracker(trackerUrl, string(infoHash), "-MT1230-rT6yUi8OpLkJ", 6881, 0, 0, 999)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+		bodyBytes, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+		decoded, err := decodeBencode(string(bodyBytes))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+		respDict := decoded.(map[string]interface{})
+		if failReason, ok := respDict["failure reason"]; ok {
+			fmt.Fprintln(os.Stderr, "Tracker error:", failReason)
+			os.Exit(1)
+		}
+		peersStr, ok := respDict["peers"].(string)
+		if !ok || len(peersStr) == 0 {
+			fmt.Fprintln(os.Stderr, "Error: no peers available for this torrent")
+			os.Exit(1)
+		}
+		peerIP := net.IP(peersStr[0:4])
+		peerPort := binary.BigEndian.Uint16([]byte(peersStr[4:6]))
+		peerAddress := net.JoinHostPort(peerIP.String(), strconv.Itoa(int(peerPort)))
+
+		// TCP connection
+		conn, err := net.Dial("tcp", peerAddress)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error connecting:", err)
+			os.Exit(1)
+		}
+		defer conn.Close()
+
+		// Build handshake with extension support
+		var handshake [68]byte
+		handshake[0] = 19
+		copy(handshake[1:20], []byte("BitTorrent protocol"))
+		handshake[25] = 0x10 // set bit 20: extension support
+		copy(handshake[28:48], infoHash)
+
+		var peerId [20]byte
+		_, err = rand.Read(peerId[:])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error generating peer ID:", err)
+			os.Exit(1)
+		}
+		copy(handshake[48:68], peerId[:])
+
+		// Send handshake
+		_, err = conn.Write(handshake[:])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error sending handshake:", err)
+			os.Exit(1)
+		}
+
+		// Receive handshake
+		var response [68]byte
+		_, err = io.ReadFull(conn, response[:])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error reading handshake:", err)
+			os.Exit(1)
+		}
+
+		// Print peer ID
+		receivedPeerId := response[48:68]
+		fmt.Println("Peer ID:", hex.EncodeToString(receivedPeerId))
+		
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", command)
 		os.Exit(1)
