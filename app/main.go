@@ -854,6 +854,34 @@ func main() {
 		}
 		fmt.Fprintf(os.Stderr, "Downloaded %s to %s.\n", torrentFile, outputPath)
 
+	case "magnet_parse":
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "Usage: ./runner.sh magnet_parse <magnet-link>")
+			os.Exit(1)
+		}
+
+		magnetLink := os.Args[2]
+
+		parsedUrl, err := url.Parse(magnetLink)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error parsing magnet link:", err)
+			os.Exit(1)
+		}
+
+		// Extract info hash from xt parameter (strip "urn:btih:" prefix)
+		xt := parsedUrl.Query().Get("xt")
+		if xt == "" {
+			fmt.Fprintln(os.Stderr, "Error: missing xt parameter")
+			os.Exit(1)
+		}
+		infoHash := xt[len("urn:btih:"):]
+
+		// Extract tracker URL (automatically URL-decoded)
+		trackerUrl := parsedUrl.Query().Get("tr")
+
+		fmt.Println("Tracker URL:", trackerUrl)
+		fmt.Println("Info Hash:", infoHash)
+
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", command)
 		os.Exit(1)
