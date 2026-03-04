@@ -1019,18 +1019,27 @@ func main() {
 				os.Exit(1)
 			}
 
-			// Receive extension handshake response
-			_, err = io.ReadFull(conn, lengthBuf)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "Error:", err)
-				os.Exit(1)
-			}
-			msgLen = binary.BigEndian.Uint32(lengthBuf)
-			msgBuf := make([]byte, msgLen)
-			_, err = io.ReadFull(conn, msgBuf)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "Error:", err)
-				os.Exit(1)
+			// Receive extension handshake response (skip non-extension messages)
+			var msgBuf []byte
+			for {
+				_, err = io.ReadFull(conn, lengthBuf)
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "Error:", err)
+					os.Exit(1)
+				}
+				msgLen = binary.BigEndian.Uint32(lengthBuf)
+				if msgLen == 0 {
+					continue
+				}
+				msgBuf = make([]byte, msgLen)
+				_, err = io.ReadFull(conn, msgBuf)
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "Error:", err)
+					os.Exit(1)
+				}
+				if msgBuf[0] == 20 {
+					break
+				}
 			}
 			// msgBuf[0] = 20 (extension), msgBuf[1] = 0 (handshake), msgBuf[2:] = bencoded dict
 			extDictStr := string(msgBuf[2:])
@@ -1173,18 +1182,27 @@ func main() {
 			os.Exit(1)
 		}
 
-		// Receive extension handshake response
-		_, err = io.ReadFull(conn, lengthBuf)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "Error:", err)
-			os.Exit(1)
-		}
-		msgLen = binary.BigEndian.Uint32(lengthBuf)
-		msgBuf := make([]byte, msgLen)
-		_, err = io.ReadFull(conn, msgBuf)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "Error:", err)
-			os.Exit(1)
+		// Receive extension handshake response (skip non-extension messages)
+		var msgBuf []byte
+		for {
+			_, err = io.ReadFull(conn, lengthBuf)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error:", err)
+				os.Exit(1)
+			}
+			msgLen = binary.BigEndian.Uint32(lengthBuf)
+			if msgLen == 0 {
+				continue
+			}
+			msgBuf = make([]byte, msgLen)
+			_, err = io.ReadFull(conn, msgBuf)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error:", err)
+				os.Exit(1)
+			}
+			if msgBuf[0] == 20 {
+				break
+			}
 		}
 
 		// Parse peer's extension handshake to get ut_metadata ID
@@ -1212,18 +1230,26 @@ func main() {
 			os.Exit(1)
 		}
 
-		// Receive metadata data response
-		_, err = io.ReadFull(conn, lengthBuf)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "Error:", err)
-			os.Exit(1)
-		}
-		msgLen = binary.BigEndian.Uint32(lengthBuf)
-		msgBuf = make([]byte, msgLen)
-		_, err = io.ReadFull(conn, msgBuf)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "Error:", err)
-			os.Exit(1)
+		// Receive metadata data response (skip non-extension messages)
+		for {
+			_, err = io.ReadFull(conn, lengthBuf)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error:", err)
+				os.Exit(1)
+			}
+			msgLen = binary.BigEndian.Uint32(lengthBuf)
+			if msgLen == 0 {
+				continue
+			}
+			msgBuf = make([]byte, msgLen)
+			_, err = io.ReadFull(conn, msgBuf)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error:", err)
+				os.Exit(1)
+			}
+			if msgBuf[0] == 20 {
+				break
+			}
 		}
 
 		// msgBuf[0] = 20, msgBuf[1] = our ut_metadata ID, msgBuf[2:] = bencoded dict + raw metadata
@@ -1269,6 +1295,682 @@ func main() {
 			}
 			fmt.Println(hex.EncodeToString([]byte(piecesStr2[i:end])))
 		}
+
+	case "magnet_download_piece":
+		if len(os.Args) < 6 || os.Args[2] != "-o" {
+			fmt.Fprintln(os.Stderr, "Usage: ./runner.sh magnet_download_piece -o <output> <magnet-link> <piece_index>")
+			os.Exit(1)
+		}
+
+		outputPath := os.Args[3]
+		magnetLink := os.Args[4]
+		pieceIndex, err := strconv.Atoi(os.Args[5])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error: invalid piece index")
+			os.Exit(1)
+		}
+
+		// Parse magnet link
+		parsedUrl, err := url.Parse(magnetLink)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error parsing magnet link:", err)
+			os.Exit(1)
+		}
+
+		xt := parsedUrl.Query().Get("xt")
+		infoHashHex := xt[len("urn:btih:"):]
+		trackerUrl := parsedUrl.Query().Get("tr")
+
+		infoHash, err := hex.DecodeString(infoHashHex)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error decoding info hash:", err)
+			os.Exit(1)
+		}
+
+		if trackerUrl == "" {
+			fmt.Fprintln(os.Stderr, "Error: magnet link has no tracker URL (tr parameter)")
+			os.Exit(1)
+		}
+
+		// Get peers from tracker
+		resp, err := getRequestToTracker(trackerUrl, string(infoHash), "-MT1230-rT6yUi8OpLkJ", 6881, 0, 0, 999)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+		bodyBytes, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+		decoded, err := decodeBencode(string(bodyBytes))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+		respDict := decoded.(map[string]interface{})
+		if failReason, ok := respDict["failure reason"]; ok {
+			fmt.Fprintln(os.Stderr, "Tracker error:", failReason)
+			os.Exit(1)
+		}
+		peersStr, ok := respDict["peers"].(string)
+		if !ok || len(peersStr) == 0 {
+			fmt.Fprintln(os.Stderr, "Error: no peers available for this torrent")
+			os.Exit(1)
+		}
+		peerIP := net.IP(peersStr[0:4])
+		peerPort := binary.BigEndian.Uint16([]byte(peersStr[4:6]))
+		peerAddress := net.JoinHostPort(peerIP.String(), strconv.Itoa(int(peerPort)))
+
+		// TCP connection & handshake with extension support
+		conn, err := net.Dial("tcp", peerAddress)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error connecting:", err)
+			os.Exit(1)
+		}
+		defer conn.Close()
+
+		var handshake [68]byte
+		handshake[0] = 19
+		copy(handshake[1:20], []byte("BitTorrent protocol"))
+		handshake[25] = 0x10
+		copy(handshake[28:48], infoHash)
+
+		var peerId [20]byte
+		_, err = rand.Read(peerId[:])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+		copy(handshake[48:68], peerId[:])
+
+		_, err = conn.Write(handshake[:])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error sending handshake:", err)
+			os.Exit(1)
+		}
+
+		var response [68]byte
+		_, err = io.ReadFull(conn, response[:])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error reading handshake:", err)
+			os.Exit(1)
+		}
+
+		// Receive bitfield
+		lengthBuf := make([]byte, 4)
+		_, err = io.ReadFull(conn, lengthBuf)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error reading bitfield length:", err)
+			os.Exit(1)
+		}
+		msgLen := binary.BigEndian.Uint32(lengthBuf)
+		if msgLen > 0 {
+			msgBuf := make([]byte, msgLen)
+			_, err = io.ReadFull(conn, msgBuf)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error reading bitfield:", err)
+				os.Exit(1)
+			}
+		}
+
+		// Send extension handshake
+		extPayload := []byte("d1:md11:ut_metadatai1eee")
+		extMsg := make([]byte, 4+1+1+len(extPayload))
+		binary.BigEndian.PutUint32(extMsg[0:4], uint32(2+len(extPayload)))
+		extMsg[4] = 20
+		extMsg[5] = 0
+		copy(extMsg[6:], extPayload)
+
+		_, err = conn.Write(extMsg)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error sending extension handshake:", err)
+			os.Exit(1)
+		}
+
+		// Receive extension handshake response (skip non-extension messages)
+		var msgBuf []byte
+		for {
+			_, err = io.ReadFull(conn, lengthBuf)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error:", err)
+				os.Exit(1)
+			}
+			msgLen = binary.BigEndian.Uint32(lengthBuf)
+			if msgLen == 0 {
+				continue
+			}
+			msgBuf = make([]byte, msgLen)
+			_, err = io.ReadFull(conn, msgBuf)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error:", err)
+				os.Exit(1)
+			}
+			if msgBuf[0] == 20 {
+				break
+			}
+		}
+
+		extDictStr := string(msgBuf[2:])
+		extPos := 0
+		extDict, _, err := decodeDict(extDictStr, &extPos)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error decoding extension handshake:", err)
+			os.Exit(1)
+		}
+		mDict := extDict["m"].(map[string]interface{})
+		peerMetadataExtId := mDict["ut_metadata"].(int)
+
+		// Send metadata request
+		metadataReqPayload := []byte("d8:msg_typei0e5:piecei0ee")
+		metadataReqMsg := make([]byte, 4+1+1+len(metadataReqPayload))
+		binary.BigEndian.PutUint32(metadataReqMsg[0:4], uint32(2+len(metadataReqPayload)))
+		metadataReqMsg[4] = 20
+		metadataReqMsg[5] = byte(peerMetadataExtId)
+		copy(metadataReqMsg[6:], metadataReqPayload)
+
+		_, err = conn.Write(metadataReqMsg)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error sending metadata request:", err)
+			os.Exit(1)
+		}
+
+		// Receive metadata data response (skip non-extension messages)
+		for {
+			_, err = io.ReadFull(conn, lengthBuf)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error:", err)
+				os.Exit(1)
+			}
+			msgLen = binary.BigEndian.Uint32(lengthBuf)
+			if msgLen == 0 {
+				continue
+			}
+			msgBuf = make([]byte, msgLen)
+			_, err = io.ReadFull(conn, msgBuf)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error:", err)
+				os.Exit(1)
+			}
+			if msgBuf[0] == 20 {
+				break
+			}
+		}
+
+		dataDictStr := string(msgBuf[2:])
+		dataPos := 0
+		_, _, err = decodeDict(dataDictStr, &dataPos)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error decoding metadata response:", err)
+			os.Exit(1)
+		}
+		rawMetadata := msgBuf[2+dataPos:]
+
+		// Verify metadata hash
+		computedHash := sha1.Sum(rawMetadata)
+		if hex.EncodeToString(computedHash[:]) != infoHashHex {
+			fmt.Fprintln(os.Stderr, "Error: metadata hash mismatch")
+			os.Exit(1)
+		}
+
+		// Parse info dictionary
+		metaStr := string(rawMetadata)
+		metaPos := 0
+		infoDict, _, err := decodeDict(metaStr, &metaPos)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error decoding info dictionary:", err)
+			os.Exit(1)
+		}
+
+		totalLength := infoDict["length"].(int)
+		normalPieceLength := infoDict["piece length"].(int)
+		piecesStr2 := infoDict["pieces"].(string)
+
+		// Calculate this piece's actual size
+		pieceLength := normalPieceLength
+		totalPieces := (totalLength + normalPieceLength - 1) / normalPieceLength
+		if pieceIndex == totalPieces-1 {
+			pieceLength = totalLength - (pieceIndex * normalPieceLength)
+		}
+
+		// Send interested (message ID = 2)
+		interested := make([]byte, 5)
+		binary.BigEndian.PutUint32(interested[0:4], 1)
+		interested[4] = 2
+		_, err = conn.Write(interested)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error sending interested:", err)
+			os.Exit(1)
+		}
+
+		// Wait for unchoke (message ID = 1)
+		for {
+			_, err = io.ReadFull(conn, lengthBuf)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error waiting for unchoke:", err)
+				os.Exit(1)
+			}
+			msgLen = binary.BigEndian.Uint32(lengthBuf)
+			if msgLen == 0 {
+				continue
+			}
+			msgBuf = make([]byte, msgLen)
+			_, err = io.ReadFull(conn, msgBuf)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error reading unchoke:", err)
+				os.Exit(1)
+			}
+			if msgBuf[0] == 1 {
+				break
+			}
+		}
+
+		// Request blocks
+		blockSize := 16384
+		pieceData := make([]byte, pieceLength)
+		totalBlocks := (pieceLength + blockSize - 1) / blockSize
+
+		for i := 0; i < totalBlocks; i++ {
+			offset := i * blockSize
+			length := blockSize
+			if offset+length > pieceLength {
+				length = pieceLength - offset
+			}
+
+			request := make([]byte, 17)
+			binary.BigEndian.PutUint32(request[0:4], 13)
+			request[4] = 6
+			binary.BigEndian.PutUint32(request[5:9], uint32(pieceIndex))
+			binary.BigEndian.PutUint32(request[9:13], uint32(offset))
+			binary.BigEndian.PutUint32(request[13:17], uint32(length))
+			_, err = conn.Write(request)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error sending request:", err)
+				os.Exit(1)
+			}
+		}
+
+		// Receive all blocks
+		blocksReceived := 0
+		for blocksReceived < totalBlocks {
+			_, err = io.ReadFull(conn, lengthBuf)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error reading piece length:", err)
+				os.Exit(1)
+			}
+			msgLen = binary.BigEndian.Uint32(lengthBuf)
+			if msgLen == 0 {
+				continue
+			}
+			msgBuf = make([]byte, msgLen)
+			_, err = io.ReadFull(conn, msgBuf)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error reading piece:", err)
+				os.Exit(1)
+			}
+			if msgBuf[0] != 7 {
+				continue
+			}
+			begin := binary.BigEndian.Uint32(msgBuf[5:9])
+			copy(pieceData[begin:], msgBuf[9:])
+			blocksReceived++
+		}
+
+		// Verify piece hash
+		expectedHash := piecesStr2[pieceIndex*20 : (pieceIndex+1)*20]
+		actualHash := sha1.Sum(pieceData)
+		if string(actualHash[:]) != expectedHash {
+			fmt.Fprintln(os.Stderr, "Error: piece hash mismatch")
+			os.Exit(1)
+		}
+
+		// Save to disk
+		err = os.WriteFile(outputPath, pieceData, 0644)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error writing file:", err)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "Piece %d downloaded to %s.\n", pieceIndex, outputPath)
+
+	case "magnet_download":
+		if len(os.Args) < 5 || os.Args[2] != "-o" {
+			fmt.Fprintln(os.Stderr, "Usage: ./runner.sh magnet_download -o <output> <magnet-link>")
+			os.Exit(1)
+		}
+
+		outputPath := os.Args[3]
+		magnetLink := os.Args[4]
+
+		// Parse magnet link
+		parsedUrl, err := url.Parse(magnetLink)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error parsing magnet link:", err)
+			os.Exit(1)
+		}
+
+		xt := parsedUrl.Query().Get("xt")
+		infoHashHex := xt[len("urn:btih:"):]
+		trackerUrl := parsedUrl.Query().Get("tr")
+
+		infoHash, err := hex.DecodeString(infoHashHex)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error decoding info hash:", err)
+			os.Exit(1)
+		}
+
+		if trackerUrl == "" {
+			fmt.Fprintln(os.Stderr, "Error: magnet link has no tracker URL (tr parameter)")
+			os.Exit(1)
+		}
+
+		// Get peers from tracker
+		resp, err := getRequestToTracker(trackerUrl, string(infoHash), "-MT1230-rT6yUi8OpLkJ", 6881, 0, 0, 999)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+		bodyBytes, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+		decoded, err := decodeBencode(string(bodyBytes))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+		respDict := decoded.(map[string]interface{})
+		if failReason, ok := respDict["failure reason"]; ok {
+			fmt.Fprintln(os.Stderr, "Tracker error:", failReason)
+			os.Exit(1)
+		}
+		peersStr, ok := respDict["peers"].(string)
+		if !ok || len(peersStr) == 0 {
+			fmt.Fprintln(os.Stderr, "Error: no peers available for this torrent")
+			os.Exit(1)
+		}
+		peerIP := net.IP(peersStr[0:4])
+		peerPort := binary.BigEndian.Uint16([]byte(peersStr[4:6]))
+		peerAddress := net.JoinHostPort(peerIP.String(), strconv.Itoa(int(peerPort)))
+
+		// TCP connection & handshake with extension support
+		conn, err := net.Dial("tcp", peerAddress)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error connecting:", err)
+			os.Exit(1)
+		}
+		defer conn.Close()
+
+		var handshake [68]byte
+		handshake[0] = 19
+		copy(handshake[1:20], []byte("BitTorrent protocol"))
+		handshake[25] = 0x10
+		copy(handshake[28:48], infoHash)
+
+		var peerId [20]byte
+		_, err = rand.Read(peerId[:])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+		copy(handshake[48:68], peerId[:])
+
+		_, err = conn.Write(handshake[:])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error sending handshake:", err)
+			os.Exit(1)
+		}
+
+		var response [68]byte
+		_, err = io.ReadFull(conn, response[:])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error reading handshake:", err)
+			os.Exit(1)
+		}
+
+		// Receive bitfield
+		lengthBuf := make([]byte, 4)
+		_, err = io.ReadFull(conn, lengthBuf)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error reading bitfield length:", err)
+			os.Exit(1)
+		}
+		msgLen := binary.BigEndian.Uint32(lengthBuf)
+		if msgLen > 0 {
+			tmpBuf := make([]byte, msgLen)
+			_, err = io.ReadFull(conn, tmpBuf)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error reading bitfield:", err)
+				os.Exit(1)
+			}
+		}
+
+		// Send extension handshake
+		extPayload := []byte("d1:md11:ut_metadatai1eee")
+		extMsg := make([]byte, 4+1+1+len(extPayload))
+		binary.BigEndian.PutUint32(extMsg[0:4], uint32(2+len(extPayload)))
+		extMsg[4] = 20
+		extMsg[5] = 0
+		copy(extMsg[6:], extPayload)
+
+		_, err = conn.Write(extMsg)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error sending extension handshake:", err)
+			os.Exit(1)
+		}
+
+		// Receive extension handshake response (skip non-extension messages)
+		var msgBuf []byte
+		for {
+			_, err = io.ReadFull(conn, lengthBuf)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error:", err)
+				os.Exit(1)
+			}
+			msgLen = binary.BigEndian.Uint32(lengthBuf)
+			if msgLen == 0 {
+				continue
+			}
+			msgBuf = make([]byte, msgLen)
+			_, err = io.ReadFull(conn, msgBuf)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error:", err)
+				os.Exit(1)
+			}
+			if msgBuf[0] == 20 {
+				break
+			}
+		}
+
+		extDictStr := string(msgBuf[2:])
+		extPos := 0
+		extDict, _, err := decodeDict(extDictStr, &extPos)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error decoding extension handshake:", err)
+			os.Exit(1)
+		}
+		mDict := extDict["m"].(map[string]interface{})
+		peerMetadataExtId := mDict["ut_metadata"].(int)
+
+		// Send metadata request
+		metadataReqPayload := []byte("d8:msg_typei0e5:piecei0ee")
+		metadataReqMsg := make([]byte, 4+1+1+len(metadataReqPayload))
+		binary.BigEndian.PutUint32(metadataReqMsg[0:4], uint32(2+len(metadataReqPayload)))
+		metadataReqMsg[4] = 20
+		metadataReqMsg[5] = byte(peerMetadataExtId)
+		copy(metadataReqMsg[6:], metadataReqPayload)
+
+		_, err = conn.Write(metadataReqMsg)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error sending metadata request:", err)
+			os.Exit(1)
+		}
+
+		// Receive metadata data response (skip non-extension messages)
+		for {
+			_, err = io.ReadFull(conn, lengthBuf)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error:", err)
+				os.Exit(1)
+			}
+			msgLen = binary.BigEndian.Uint32(lengthBuf)
+			if msgLen == 0 {
+				continue
+			}
+			msgBuf = make([]byte, msgLen)
+			_, err = io.ReadFull(conn, msgBuf)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error:", err)
+				os.Exit(1)
+			}
+			if msgBuf[0] == 20 {
+				break
+			}
+		}
+
+		dataDictStr := string(msgBuf[2:])
+		dataPos := 0
+		_, _, err = decodeDict(dataDictStr, &dataPos)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error decoding metadata response:", err)
+			os.Exit(1)
+		}
+		rawMetadata := msgBuf[2+dataPos:]
+
+		// Verify metadata hash
+		computedHash := sha1.Sum(rawMetadata)
+		if hex.EncodeToString(computedHash[:]) != infoHashHex {
+			fmt.Fprintln(os.Stderr, "Error: metadata hash mismatch")
+			os.Exit(1)
+		}
+
+		// Parse info dictionary
+		metaStr := string(rawMetadata)
+		metaPos := 0
+		infoDict, _, err := decodeDict(metaStr, &metaPos)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error decoding info dictionary:", err)
+			os.Exit(1)
+		}
+
+		totalLength := infoDict["length"].(int)
+		normalPieceLength := infoDict["piece length"].(int)
+		piecesStr2 := infoDict["pieces"].(string)
+
+		// Send interested (message ID = 2)
+		interested := make([]byte, 5)
+		binary.BigEndian.PutUint32(interested[0:4], 1)
+		interested[4] = 2
+		_, err = conn.Write(interested)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error sending interested:", err)
+			os.Exit(1)
+		}
+
+		// Wait for unchoke (message ID = 1)
+		for {
+			_, err = io.ReadFull(conn, lengthBuf)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error waiting for unchoke:", err)
+				os.Exit(1)
+			}
+			msgLen = binary.BigEndian.Uint32(lengthBuf)
+			if msgLen == 0 {
+				continue
+			}
+			msgBuf = make([]byte, msgLen)
+			_, err = io.ReadFull(conn, msgBuf)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error reading unchoke:", err)
+				os.Exit(1)
+			}
+			if msgBuf[0] == 1 {
+				break
+			}
+		}
+
+		// Download all pieces
+		totalPieces := (totalLength + normalPieceLength - 1) / normalPieceLength
+		fileData := make([]byte, 0, totalLength)
+		blockSize := 16384
+
+		for i := 0; i < totalPieces; i++ {
+			pieceLength := normalPieceLength
+			if i == totalPieces-1 {
+				pieceLength = totalLength - (i * normalPieceLength)
+			}
+
+			totalBlocks := (pieceLength + blockSize - 1) / blockSize
+			pieceData := make([]byte, pieceLength)
+
+			// Send all block requests for this piece
+			for j := 0; j < totalBlocks; j++ {
+				offset := j * blockSize
+				length := blockSize
+				if offset+length > pieceLength {
+					length = pieceLength - offset
+				}
+
+				request := make([]byte, 17)
+				binary.BigEndian.PutUint32(request[0:4], 13)
+				request[4] = 6
+				binary.BigEndian.PutUint32(request[5:9], uint32(i))
+				binary.BigEndian.PutUint32(request[9:13], uint32(offset))
+				binary.BigEndian.PutUint32(request[13:17], uint32(length))
+				_, err = conn.Write(request)
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "Error sending request:", err)
+					os.Exit(1)
+				}
+			}
+
+			// Receive all blocks for this piece
+			blocksReceived := 0
+			for blocksReceived < totalBlocks {
+				_, err = io.ReadFull(conn, lengthBuf)
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "Error reading piece length:", err)
+					os.Exit(1)
+				}
+				msgLen = binary.BigEndian.Uint32(lengthBuf)
+				if msgLen == 0 {
+					continue
+				}
+				msgBuf = make([]byte, msgLen)
+				_, err = io.ReadFull(conn, msgBuf)
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "Error reading piece:", err)
+					os.Exit(1)
+				}
+				if msgBuf[0] != 7 {
+					continue
+				}
+				begin := binary.BigEndian.Uint32(msgBuf[5:9])
+				copy(pieceData[begin:], msgBuf[9:])
+				blocksReceived++
+			}
+
+			// Verify piece hash
+			expectedHash := piecesStr2[i*20 : (i+1)*20]
+			actualHash := sha1.Sum(pieceData)
+			if string(actualHash[:]) != expectedHash {
+				fmt.Fprintf(os.Stderr, "Error: hash mismatch for piece %d\n", i)
+				os.Exit(1)
+			}
+
+			fileData = append(fileData, pieceData...)
+			fmt.Fprintf(os.Stderr, "Piece %d/%d downloaded and verified.\n", i+1, totalPieces)
+		}
+
+		// Save complete file
+		err = os.WriteFile(outputPath, fileData, 0644)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error writing file:", err)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "Downloaded to %s.\n", outputPath)
 
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", command)
