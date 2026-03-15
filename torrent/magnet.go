@@ -1,0 +1,123 @@
+package torrent
+
+import (
+	"crypto/sha1"
+	"encoding/hex"
+	"fmt"
+	"net/url"
+
+	"github.com/codebabbler/bittorrent-client-go/bencode"
+)
+
+// MagnetLink holds parsed magnet link data.
+type MagnetLink struct {
+	InfoHash    []byte
+	InfoHashHex string
+	Name        string
+	TrackerURL  string
+}
+
+// ParseMagnet parses a magnet URI and extracts info hash and tracker URL.
+func ParseMagnet(uri string) (*MagnetLink, error) {
+	parsedUrl, err := url.Parse(uri)
+	if err != nil {
+		return nil, fmt.Errorf("parsing magnet link: %w", err)
+	}
+
+	xt := parsedUrl.Query().Get("xt")
+	if xt == "" {
+		return nil, fmt.Errorf("missing xt parameter")
+	}
+
+	infoHashHex := xt[len("urn:btih:"):]
+	infoHash, err := hex.DecodeString(infoHashHex)
+	if err != nil {
+		return nil, fmt.Errorf("decoding info hash: %w", err)
+	}
+
+	return &MagnetLink{
+		InfoHash:    infoHash,
+		InfoHashHex: infoHashHex,
+		Name:        parsedUrl.Query().Get("dn"),
+		TrackerURL:  parsedUrl.Query().Get("tr"),
+	}, nil
+}
+
+// ToTorrentFile converts raw metadata (the bencoded info dict) received from
+// a peer via BEP 9 into a TorrentFile. It verifies the SHA-1 hash matches.
+func (m *MagnetLink) ToTorrentFile(rawMetadata []byte) (*TorrentFile, error) {
+	// Verify info hash
+	computedHash := sha1.Sum(rawMetadata)
+	if hex.EncodeToString(computedHash[:]) != m.InfoHashHex {
+		return nil, fmt.Errorf("metadata hash mismatch")
+	}
+
+	metaStr := string(rawMetadata)
+	metaPos := 0
+	infoDict, _, err := bencode.DecodeDict(metaStr, &metaPos)
+	if err != nil {
+		return nil, fmt.Errorf("decoding info dictionary: %w", err)
+	}
+
+
+
+	pieceLength, ok := infoDict["piece length"].(int)
+	if !ok {
+		return nil, fmt.Errorf("piece length not found in info dict")
+	}
+
+	pieces, ok := infoDict["pieces"].(string)
+	if !ok {
+		return nil, fmt.Errorf("pieces not found in info dict")
+	}
+
+	name, _ := infoDict["name"].(string)
+
+	tf := &TorrentFile{
+		Announce:    m.TrackerURL,
+		InfoHash:    computedHash,
+		InfoHashHex: m.InfoHashHex,
+		PieceLength: pieceLength,
+		Name:        name,
+		Pieces:      pieces,
+	}
+
+	// Detect multi-file vs single-file
+	if filesList, ok := infoDict["files"].([]interface{}); ok {
+		tf.IsMultiFile = true
+		totalLength := 0
+		for _, f := range filesList {
+			fileDict, ok := f.(map[string]interface{})
+			if !ok {
+				return nil, fmt.Errorf("invalid file entry in info dict")
+			}
+			fl, ok := fileDict["length"].(int)
+			if !ok {
+				return nil, fmt.Errorf("file entry missing length")
+			}
+			var path []string
+			pathList, ok := fileDict["path"].([]interface{})
+			if !ok {
+				return nil, fmt.Errorf("file entry missing path")
+			}
+			for _, p := range pathList {
+				ps, ok := p.(string)
+				if !ok {
+					return nil, fmt.Errorf("invalid path component")
+				}
+				path = append(path, ps)
+			}
+			tf.Files = append(tf.Files, FileEntry{Length: fl, Path: path})
+			totalLength += fl
+		}
+		tf.Length = totalLength
+	} else {
+		length, ok := infoDict["length"].(int)
+		if !ok {
+			return nil, fmt.Errorf("length not found in info dict")
+		}
+		tf.Length = length
+	}
+
+	return tf, nil
+}
