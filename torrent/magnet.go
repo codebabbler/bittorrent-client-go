@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/url"
+	"strings"
 
 	"github.com/codebabbler/bittorrent-client-go/bencode"
 )
@@ -15,6 +16,7 @@ type MagnetLink struct {
 	InfoHashHex string
 	Name        string
 	TrackerURL  string
+	TrackerURLs []string
 }
 
 // ParseMagnet parses a magnet URI and extracts info hash and tracker URL.
@@ -29,17 +31,24 @@ func ParseMagnet(uri string) (*MagnetLink, error) {
 		return nil, fmt.Errorf("missing xt parameter")
 	}
 
-	infoHashHex := xt[len("urn:btih:"):]
+	infoHashHex := strings.ToLower(xt[len("urn:btih:"):])
 	infoHash, err := hex.DecodeString(infoHashHex)
 	if err != nil {
 		return nil, fmt.Errorf("decoding info hash: %w", err)
+	}
+
+	trackers := parsedUrl.Query()["tr"]
+	var primaryTracker string
+	if len(trackers) > 0 {
+		primaryTracker = trackers[0]
 	}
 
 	return &MagnetLink{
 		InfoHash:    infoHash,
 		InfoHashHex: infoHashHex,
 		Name:        parsedUrl.Query().Get("dn"),
-		TrackerURL:  parsedUrl.Query().Get("tr"),
+		TrackerURL:  primaryTracker,
+		TrackerURLs: trackers,
 	}, nil
 }
 
@@ -49,7 +58,7 @@ func (m *MagnetLink) ToTorrentFile(rawMetadata []byte) (*TorrentFile, error) {
 	// Verify info hash
 	computedHash := sha1.Sum(rawMetadata)
 	if hex.EncodeToString(computedHash[:]) != m.InfoHashHex {
-		return nil, fmt.Errorf("metadata hash mismatch")
+		return nil, fmt.Errorf("metadata hash mismatch: computed %s, expected %s", hex.EncodeToString(computedHash[:]), m.InfoHashHex)
 	}
 
 	metaStr := string(rawMetadata)

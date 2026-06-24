@@ -15,8 +15,8 @@ const (
 	actionConnect    uint32 = 0
 	actionAnnounce   uint32 = 1
 
-	udpConnectTimeout = 15 * time.Second
-	udpMaxRetries     = 3
+	udpConnectTimeout = 3 * time.Second
+	udpMaxRetries     = 2
 )
 
 // GetPeersUDP contacts a UDP tracker and returns a list of peers.

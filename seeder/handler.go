@@ -29,7 +29,7 @@ func handlePeer(conn net.Conn, infoHash [20]byte, pieces [][]byte, numPieces int
 	}
 
 	// Send handshake back
-	_, err = peer.DoHandshake(conn, infoHash[:], false)
+	_, _, err = peer.DoHandshake(conn, infoHash[:], false)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Seeder: send handshake error: %v\n", err)
 		return

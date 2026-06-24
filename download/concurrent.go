@@ -12,9 +12,10 @@ import (
 
 // pieceWork represents a piece to download.
 type pieceWork struct {
-	Index       int
-	Length      int
+	Index        int
+	Length       int
 	ExpectedHash string // raw 20-byte hash
+	Retries      int
 }
 
 // pieceResult holds a downloaded and verified piece.
@@ -47,8 +48,8 @@ func ConcurrentFile(
 		numWorkers = 1
 	}
 
-	// Create work channel
-	workCh := make(chan pieceWork, totalPieces)
+	// Create work channel (buffered to accommodate retries)
+	workCh := make(chan pieceWork, totalPieces*4)
 	for i := 0; i < totalPieces; i++ {
 		pl := pieceLength
 		if i == totalPieces-1 {
@@ -58,13 +59,15 @@ func ConcurrentFile(
 			Index:        i,
 			Length:       pl,
 			ExpectedHash: pieces[i*20 : (i+1)*20],
+			Retries:      0,
 		}
 	}
-	close(workCh)
 
-	// Results channel
+	// Results channels
 	resultCh := make(chan pieceResult, totalPieces)
 	errCh := make(chan error, numWorkers)
+	done := make(chan struct{})
+	defer close(done)
 
 	var wg sync.WaitGroup
 
@@ -93,48 +96,97 @@ func ConcurrentFile(
 				return
 			}
 
-			for work := range workCh {
-				data, err := client.DownloadPiece(work.Index, work.Length)
-				if err != nil {
-					// Put work back for another worker (best effort)
-					fmt.Fprintf(os.Stderr, "Worker: piece %d error on %s: %v\n", work.Index, peerAddr, err)
-					errCh <- fmt.Errorf("piece %d: %w", work.Index, err)
+			for {
+				select {
+				case <-done:
 					return
-				}
+				case work := <-workCh:
+					data, err := client.DownloadPiece(work.Index, work.Length)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "Worker: piece %d error on %s: %v\n", work.Index, peerAddr, err)
+						if work.Retries < 3 {
+							select {
+							case workCh <- pieceWork{
+								Index:        work.Index,
+								Length:       work.Length,
+								ExpectedHash: work.ExpectedHash,
+								Retries:      work.Retries + 1,
+							}:
+							case <-done:
+							}
+						} else {
+							select {
+							case errCh <- fmt.Errorf("piece %d failed after 3 retries: %w", work.Index, err):
+							case <-done:
+							}
+							return
+						}
+						continue
+					}
 
-				// Verify hash
-				actualHash := sha1.Sum(data)
-				if string(actualHash[:]) != work.ExpectedHash {
-					errCh <- fmt.Errorf("hash mismatch for piece %d", work.Index)
-					return
-				}
+					// Verify hash
+					actualHash := sha1.Sum(data)
+					if string(actualHash[:]) != work.ExpectedHash {
+						fmt.Fprintf(os.Stderr, "Worker: hash mismatch for piece %d on %s\n", work.Index, peerAddr)
+						if work.Retries < 3 {
+							select {
+							case workCh <- pieceWork{
+								Index:        work.Index,
+								Length:       work.Length,
+								ExpectedHash: work.ExpectedHash,
+								Retries:      work.Retries + 1,
+							}:
+							case <-done:
+							}
+						} else {
+							select {
+							case errCh <- fmt.Errorf("hash mismatch for piece %d after 3 retries", work.Index):
+							case <-done:
+							}
+							return
+						}
+						continue
+					}
 
-				resultCh <- pieceResult{Index: work.Index, Data: data}
-				fmt.Fprintf(os.Stderr, "Piece %d downloaded from %s\n", work.Index, peerAddr)
+					select {
+					case resultCh <- pieceResult{Index: work.Index, Data: data}:
+					case <-done:
+					}
+					fmt.Fprintf(os.Stderr, "Piece %d downloaded from %s\n", work.Index, peerAddr)
+				}
 			}
 		}(peers[w%len(peers)].Address())
 	}
 
-	// Close results when all workers finish
+	// Monitor when all workers finish
+	allWorkersDone := make(chan struct{})
 	go func() {
 		wg.Wait()
-		close(resultCh)
-		close(errCh)
+		close(allWorkersDone)
 	}()
 
 	// Collect results
 	pieceMap := make(map[int][]byte, totalPieces)
-	for result := range resultCh {
-		pieceMap[result.Index] = result.Data
+	var downloadErr error
+
+	for len(pieceMap) < totalPieces {
+		select {
+		case result := <-resultCh:
+			pieceMap[result.Index] = result.Data
+		case err := <-errCh:
+			downloadErr = err
+			goto finished
+		case <-allWorkersDone:
+			if len(pieceMap) < totalPieces {
+				downloadErr = fmt.Errorf("all workers exited before completing download (got %d/%d pieces)", len(pieceMap), totalPieces)
+			}
+			goto finished
+		}
 	}
 
-	// Check for errors
-	if err, ok := <-errCh; ok {
-		return nil, err
-	}
-
-	if len(pieceMap) != totalPieces {
-		return nil, fmt.Errorf("only downloaded %d/%d pieces", len(pieceMap), totalPieces)
+finished:
+	if downloadErr != nil {
+		return nil, downloadErr
 	}
 
 	// Assemble in order

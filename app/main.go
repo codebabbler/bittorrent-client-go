@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"sync"
 
 	"github.com/codebabbler/bittorrent-client-go/bencode"
 	"github.com/codebabbler/bittorrent-client-go/dht"
@@ -191,20 +192,30 @@ func main() {
 			os.Exit(1)
 		}
 
-		peers, err := tracker.GetPeers(tf.Announce, tf.InfoHash[:], tf.Length)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "Error:", err)
-			os.Exit(1)
+		targetOutput := outputPath
+		if tf.IsMultiFile {
+			targetOutput = outputPath + ".tmp"
 		}
 
-		// Concurrent download from multiple peers (up to 5 workers)
-		fileData, err := download.ConcurrentFile(peers, tf.InfoHash[:], tf.Pieces, tf.Length, tf.PieceLength, 5)
+		sess := download.NewSession(30, 15)
+		discoverPeers := func() ([]tracker.Peer, error) {
+			return tracker.GetPeers(tf.Announce, tf.InfoHash[:], tf.Length)
+		}
+
+		err = sess.Download(tf.InfoHash[:], tf.Pieces, tf.Length, tf.PieceLength, targetOutput, discoverPeers)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
 			os.Exit(1)
 		}
 
 		if tf.IsMultiFile {
+			fileData, err := os.ReadFile(targetOutput)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error reading temp file:", err)
+				os.Exit(1)
+			}
+			os.Remove(targetOutput)
+
 			err = download.WriteFiles(outputPath, tf, fileData)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "Error writing files:", err)
@@ -212,11 +223,6 @@ func main() {
 			}
 			fmt.Fprintf(os.Stderr, "Downloaded multi-file torrent to %s/%s/\n", outputPath, tf.Name)
 		} else {
-			err = os.WriteFile(outputPath, fileData, 0644)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "Error writing file:", err)
-				os.Exit(1)
-			}
 			fmt.Fprintf(os.Stderr, "Downloaded %s to %s.\n", torrentFile, outputPath)
 		}
 
@@ -247,13 +253,13 @@ func main() {
 			os.Exit(1)
 		}
 
-		peers, err := tracker.GetPeers(magnet.TrackerURL, magnet.InfoHash, 999)
+		peers, err := discoverPeersForMagnet(magnet)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
 			os.Exit(1)
 		}
 
-		client, err := peer.NewClient(peers[0].Address(), magnet.InfoHash, true)
+		client, err := connectToWorkingPeer(peers, magnet.InfoHash, false)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
 			os.Exit(1)
@@ -282,24 +288,18 @@ func main() {
 			os.Exit(1)
 		}
 
-		peers, err := tracker.GetPeers(magnet.TrackerURL, magnet.InfoHash, 999)
+		peers, err := discoverPeersForMagnet(magnet)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
 			os.Exit(1)
 		}
 
-		client, err := peer.NewClient(peers[0].Address(), magnet.InfoHash, true)
+		client, err := connectToWorkingPeer(peers, magnet.InfoHash, true)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
 			os.Exit(1)
 		}
 		defer client.Close()
-
-		err = client.SetupExtensions()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "Error:", err)
-			os.Exit(1)
-		}
 
 		rawMetadata, err := client.FetchMetadata()
 		if err != nil {
@@ -342,24 +342,18 @@ func main() {
 			os.Exit(1)
 		}
 
-		peers, err := tracker.GetPeers(magnet.TrackerURL, magnet.InfoHash, 999)
+		peers, err := discoverPeersForMagnet(magnet)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
 			os.Exit(1)
 		}
 
-		client, err := peer.NewClient(peers[0].Address(), magnet.InfoHash, true)
+		client, err := connectToWorkingPeer(peers, magnet.InfoHash, true)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
 			os.Exit(1)
 		}
 		defer client.Close()
-
-		err = client.SetupExtensions()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "Error:", err)
-			os.Exit(1)
-		}
 
 		rawMetadata, err := client.FetchMetadata()
 		if err != nil {
@@ -420,24 +414,18 @@ func main() {
 			os.Exit(1)
 		}
 
-		peers, err := tracker.GetPeers(magnet.TrackerURL, magnet.InfoHash, 999)
+		peers, err := discoverPeersForMagnet(magnet)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
 			os.Exit(1)
 		}
 
-		client, err := peer.NewClient(peers[0].Address(), magnet.InfoHash, true)
+		client, err := connectToWorkingPeer(peers, magnet.InfoHash, true)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
 			os.Exit(1)
 		}
 		defer client.Close()
-
-		err = client.SetupExtensions()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "Error:", err)
-			os.Exit(1)
-		}
 
 		rawMetadata, err := client.FetchMetadata()
 		if err != nil {
@@ -451,25 +439,32 @@ func main() {
 			os.Exit(1)
 		}
 
-		err = client.SendInterested()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "Error:", err)
-			os.Exit(1)
+		client.Close()
+
+		targetOutput := outputPath
+		if tf.IsMultiFile {
+			targetOutput = outputPath + ".tmp"
 		}
 
-		err = client.WaitForUnchoke()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "Error:", err)
-			os.Exit(1)
+		sess := download.NewSession(30, 15)
+		discoverPeers := func() ([]tracker.Peer, error) {
+			return discoverPeersForMagnet(magnet)
 		}
 
-		fileData, err := download.File(client, tf.Pieces, tf.Length, tf.PieceLength)
+		err = sess.Download(tf.InfoHash[:], tf.Pieces, tf.Length, tf.PieceLength, targetOutput, discoverPeers)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
 			os.Exit(1)
 		}
 
 		if tf.IsMultiFile {
+			fileData, err := os.ReadFile(targetOutput)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Error reading temp file:", err)
+				os.Exit(1)
+			}
+			os.Remove(targetOutput)
+
 			err = download.WriteFiles(outputPath, tf, fileData)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "Error writing files:", err)
@@ -477,11 +472,6 @@ func main() {
 			}
 			fmt.Fprintf(os.Stderr, "Downloaded multi-file torrent to %s/%s/\n", outputPath, tf.Name)
 		} else {
-			err = os.WriteFile(outputPath, fileData, 0644)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "Error writing file:", err)
-				os.Exit(1)
-			}
 			fmt.Fprintf(os.Stderr, "Downloaded to %s.\n", outputPath)
 		}
 
@@ -553,4 +543,169 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", command)
 		os.Exit(1)
 	}
+}
+
+func discoverPeersForMagnet(magnet *torrent.MagnetLink) ([]tracker.Peer, error) {
+	var allPeers []tracker.Peer
+	seenPeers := make(map[string]bool)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	addPeers := func(peers []tracker.Peer, source string) {
+		mu.Lock()
+		defer mu.Unlock()
+		added := 0
+		for _, p := range peers {
+			addr := p.Address()
+			if !seenPeers[addr] {
+				seenPeers[addr] = true
+				allPeers = append(allPeers, p)
+				added++
+			}
+		}
+		if added > 0 {
+			fmt.Fprintf(os.Stderr, "Discovered %d new peers from %s\n", added, source)
+		}
+	}
+
+	// 1. Gather all tracker URLs to query
+	var trackerURLs []string
+	if len(magnet.TrackerURLs) > 0 {
+		trackerURLs = magnet.TrackerURLs
+	} else if magnet.TrackerURL != "" {
+		trackerURLs = []string{magnet.TrackerURL}
+	}
+
+	// 2. Query trackers in parallel
+	if len(trackerURLs) > 0 {
+		fmt.Fprintf(os.Stderr, "Querying %d trackers in parallel...\n", len(trackerURLs))
+		for _, trURL := range trackerURLs {
+			wg.Add(1)
+			go func(urlStr string) {
+				defer wg.Done()
+				peers, err := tracker.GetPeers(urlStr, magnet.InfoHash, 999)
+				if err != nil {
+					return
+				}
+				addPeers(peers, urlStr)
+			}(trURL)
+		}
+	}
+
+	// 3. Query DHT in parallel
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		fmt.Fprintln(os.Stderr, "Querying DHT for peers...")
+		d, err := dht.New(0) // bind to ephemeral port
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to start DHT: %v\n", err)
+			return
+		}
+		defer d.Close()
+		err = d.Bootstrap(dht.DefaultBootstrapNodes)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "DHT bootstrap error: %v\n", err)
+			return
+		}
+		var infoHash [20]byte
+		copy(infoHash[:], magnet.InfoHash)
+		peers, err := d.GetPeers(infoHash)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "DHT lookup error: %v\n", err)
+			return
+		}
+		addPeers(peers, "DHT")
+	}()
+
+	// Wait for all discovery tasks to complete
+	wg.Wait()
+
+	if len(allPeers) == 0 {
+		return nil, fmt.Errorf("could not find any peers via trackers or DHT")
+	}
+
+	return allPeers, nil
+}
+
+func connectToWorkingPeer(peers []tracker.Peer, infoHash []byte, setupExtensions bool) (*peer.Client, error) {
+	if len(peers) == 0 {
+		return nil, fmt.Errorf("no peers to connect to")
+	}
+
+	resultChan := make(chan *peer.Client, 1)
+	errChan := make(chan error, len(peers))
+	done := make(chan struct{})
+	defer close(done)
+
+	// Limit concurrency to 15 parallel dialing goroutines
+	sem := make(chan struct{}, 15)
+
+	var wg sync.WaitGroup
+	for _, p := range peers {
+		wg.Add(1)
+		go func(peerAddr string) {
+			defer wg.Done()
+
+			select {
+			case <-done:
+				return
+			case sem <- struct{}{}:
+			}
+			defer func() { <-sem }()
+
+			fmt.Fprintf(os.Stderr, "Trying to connect to peer %s...\n", peerAddr)
+			client, err := peer.NewClient(peerAddr, infoHash, setupExtensions)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to connect to peer %s: %v\n", peerAddr, err)
+				select {
+				case errChan <- err:
+				case <-done:
+				}
+				return
+			}
+
+			if setupExtensions {
+				err = client.SetupExtensions()
+				if err != nil {
+					client.Close()
+					fmt.Fprintf(os.Stderr, "Failed extension handshake with peer %s: %v\n", peerAddr, err)
+					select {
+					case errChan <- err:
+					case <-done:
+					}
+					return
+				}
+			}
+
+			// Successfully connected and completed handshakes!
+			select {
+			case resultChan <- client:
+			case <-done:
+				client.Close()
+			}
+		}(p.Address())
+	}
+
+	// Close errChan when all dialers finish
+	go func() {
+		wg.Wait()
+		close(errChan)
+	}()
+
+	select {
+	case client := <-resultChan:
+		return client, nil
+	case <-errChan:
+		// Collect errors if all failed
+		var lastErr error
+		for err := range errChan {
+			lastErr = err
+		}
+		if lastErr != nil {
+			return nil, fmt.Errorf("failed to connect/setup extensions with any peer: %w", lastErr)
+		}
+	}
+
+	return nil, fmt.Errorf("failed to connect to any peer")
 }

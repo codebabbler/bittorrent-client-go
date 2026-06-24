@@ -1,7 +1,6 @@
 package peer
 
 import (
-	"crypto/rand"
 	"fmt"
 	"io"
 	"net"
@@ -9,8 +8,8 @@ import (
 
 // DoHandshake performs the BitTorrent handshake on an existing connection.
 // If extensions is true, sets bit 20 in the reserved bytes.
-// Returns the peer's ID from the response.
-func DoHandshake(conn net.Conn, infoHash []byte, extensions bool) ([20]byte, error) {
+// Returns the peer's ID and whether the peer supports extensions from the response.
+func DoHandshake(conn net.Conn, infoHash []byte, extensions bool) ([20]byte, bool, error) {
 	var handshake [68]byte
 	handshake[0] = 19
 	copy(handshake[1:20], []byte("BitTorrent protocol"))
@@ -21,27 +20,24 @@ func DoHandshake(conn net.Conn, infoHash []byte, extensions bool) ([20]byte, err
 
 	copy(handshake[28:48], infoHash)
 
-	var peerId [20]byte
-	_, err := rand.Read(peerId[:])
-	if err != nil {
-		return [20]byte{}, fmt.Errorf("generating peer ID: %w", err)
-	}
+	peerId := [20]byte{'-', 'M', 'T', '1', '2', '3', '0', '-', 'r', 'T', '6', 'y', 'U', 'i', '8', 'O', 'p', 'L', 'k', 'J'}
 	copy(handshake[48:68], peerId[:])
 
-	_, err = conn.Write(handshake[:])
+	_, err := conn.Write(handshake[:])
 	if err != nil {
-		return [20]byte{}, fmt.Errorf("sending handshake: %w", err)
+		return [20]byte{}, false, fmt.Errorf("sending handshake: %w", err)
 	}
 
 	var response [68]byte
 	_, err = io.ReadFull(conn, response[:])
 	if err != nil {
-		return [20]byte{}, fmt.Errorf("reading handshake: %w", err)
+		return [20]byte{}, false, fmt.Errorf("reading handshake: %w", err)
 	}
 
 	var peerID [20]byte
 	copy(peerID[:], response[48:68])
-	return peerID, nil
+	peerSupportsExtensions := (response[25] & 0x10) != 0
+	return peerID, peerSupportsExtensions, nil
 }
 
 // ReceiveHandshake reads an incoming handshake (for seeding — we receive first).

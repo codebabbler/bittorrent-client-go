@@ -4,40 +4,149 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"sync"
+	"time"
+
+	"github.com/codebabbler/bittorrent-client-go/bencode"
 )
+
+// bufferedMsg represents a message that has been read but not yet processed.
+type bufferedMsg struct {
+	id      uint8
+	payload []byte
+}
 
 // Client wraps a TCP connection to a BitTorrent peer.
 type Client struct {
-	Conn              net.Conn
-	PeerID            [20]byte
-	PeerMetadataExtId int
+	Conn                   net.Conn
+	Address                string
+	PeerID                 [20]byte
+	PeerMetadataExtId      int
+	SupportsExtensions     bool
+	ExtensionHandshakeSent bool
+	bufferedMsgs           []bufferedMsg
+
+	// Asynchronous state
+	Choked                 bool
+	Interested             bool
+	LastRead               time.Time
+	LastWrite              time.Time
+	StallScore             int
+	mu                     sync.Mutex
+	OutstandingRequests    map[string]OutstandingRequest
+	writeCh                chan []byte
+	done                   chan struct{}
 }
 
 // NewClient dials a peer, performs the handshake, and reads the bitfield.
 func NewClient(address string, infoHash []byte, extensions bool) (*Client, error) {
-	conn, err := net.Dial("tcp", address)
+	conn, err := net.DialTimeout("tcp", address, 5*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("connecting: %w", err)
 	}
 
-	peerID, err := DoHandshake(conn, infoHash, extensions)
+	// Set deadline for handshake and bitfield exchange
+	err = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("setting deadline: %w", err)
+	}
+
+	peerID, supportsExtensions, err := DoHandshake(conn, infoHash, extensions)
 	if err != nil {
 		conn.Close()
 		return nil, err
 	}
 
-	err = ReadBitfield(conn)
-	if err != nil {
+	if extensions && !supportsExtensions {
 		conn.Close()
-		return nil, err
+		return nil, fmt.Errorf("peer does not support extensions")
 	}
 
-	return &Client{Conn: conn, PeerID: peerID}, nil
+	client := &Client{
+		Conn:               conn,
+		Address:            address,
+		PeerID:             peerID,
+		SupportsExtensions: supportsExtensions,
+	}
+
+	if extensions && supportsExtensions {
+		extPayload := []byte("d1:md11:ut_metadatai1eee")
+		err = WriteMessage(conn, MsgExtension, append([]byte{0}, extPayload...))
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("sending extension handshake: %w", err)
+		}
+		client.ExtensionHandshakeSent = true
+	}
+
+	// Read initial messages (like bitfield or extension handshake) with a short timeout
+	for {
+		err = conn.SetReadDeadline(time.Now().Add(1500 * time.Millisecond))
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("setting read deadline: %w", err)
+		}
+
+		id, payload, err := ReadMessage(conn)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				break // no more messages for now
+			}
+			conn.Close()
+			return nil, fmt.Errorf("reading initial message: %w", err)
+		}
+
+		if payload == nil {
+			continue // keepalive
+		}
+
+		if id == MsgBitfield {
+			// Consume bitfield (we don't store it)
+		} else {
+			if id == MsgExtension && len(payload) > 1 && payload[0] == 0 {
+				dictStr := string(payload[1:])
+				pos := 0
+				extDict, _, err := bencode.DecodeDict(dictStr, &pos)
+				if err == nil {
+					if mDict, ok := extDict["m"].(map[string]interface{}); ok {
+						if peerExtId, ok := mDict["ut_metadata"].(int); ok {
+							client.PeerMetadataExtId = peerExtId
+						}
+					}
+				}
+			}
+			// Buffer other messages (e.g. MsgExtension)
+			client.bufferedMsgs = append(client.bufferedMsgs, bufferedMsg{id: id, payload: payload})
+		}
+	}
+
+	// Reset deadline for subsequent message processing
+	err = conn.SetDeadline(time.Time{})
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("clearing deadline: %w", err)
+	}
+
+	return client, nil
+}
+
+// ReadMessage reads a message from the buffer if one exists, otherwise reads from the network.
+func (c *Client) ReadMessage() (uint8, []byte, error) {
+	if len(c.bufferedMsgs) > 0 {
+		msg := c.bufferedMsgs[0]
+		c.bufferedMsgs = c.bufferedMsgs[1:]
+		return msg.id, msg.payload, nil
+	}
+	return ReadMessage(c.Conn)
 }
 
 // SetupExtensions performs the extension handshake.
 func (c *Client) SetupExtensions() error {
-	peerExtId, err := DoExtensionHandshake(c.Conn)
+	if c.PeerMetadataExtId != 0 {
+		return nil
+	}
+	peerExtId, err := c.DoExtensionHandshake()
 	if err != nil {
 		return err
 	}
@@ -47,7 +156,7 @@ func (c *Client) SetupExtensions() error {
 
 // FetchMetadata requests and returns the raw metadata bytes from the peer.
 func (c *Client) FetchMetadata() ([]byte, error) {
-	return RequestMetadata(c.Conn, c.PeerMetadataExtId)
+	return c.RequestMetadata(c.PeerMetadataExtId)
 }
 
 // SendInterested sends an interested message.
@@ -57,8 +166,14 @@ func (c *Client) SendInterested() error {
 
 // WaitForUnchoke waits until the peer sends an unchoke message.
 func (c *Client) WaitForUnchoke() error {
+	err := c.Conn.SetDeadline(time.Now().Add(15 * time.Second))
+	if err != nil {
+		return fmt.Errorf("setting unchoke deadline: %w", err)
+	}
+	defer c.Conn.SetDeadline(time.Time{})
+
 	for {
-		id, payload, err := ReadMessage(c.Conn)
+		id, payload, err := c.ReadMessage()
 		if err != nil {
 			return fmt.Errorf("waiting for unchoke: %w", err)
 		}
@@ -73,6 +188,12 @@ func (c *Client) WaitForUnchoke() error {
 
 // DownloadPiece downloads a single piece by requesting 16 KiB blocks.
 func (c *Client) DownloadPiece(pieceIndex, pieceLength int) ([]byte, error) {
+	err := c.Conn.SetDeadline(time.Now().Add(30 * time.Second))
+	if err != nil {
+		return nil, fmt.Errorf("setting piece deadline: %w", err)
+	}
+	defer c.Conn.SetDeadline(time.Time{})
+
 	blockSize := 16384
 	totalBlocks := (pieceLength + blockSize - 1) / blockSize
 	pieceData := make([]byte, pieceLength)
@@ -98,7 +219,7 @@ func (c *Client) DownloadPiece(pieceIndex, pieceLength int) ([]byte, error) {
 	// Receive all blocks
 	blocksReceived := 0
 	for blocksReceived < totalBlocks {
-		id, payload, err := ReadMessage(c.Conn)
+		id, payload, err := c.ReadMessage()
 		if err != nil {
 			return nil, fmt.Errorf("reading piece block: %w", err)
 		}
@@ -118,5 +239,15 @@ func (c *Client) DownloadPiece(pieceIndex, pieceLength int) ([]byte, error) {
 
 // Close closes the connection.
 func (c *Client) Close() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.done != nil {
+		select {
+		case <-c.done:
+			return
+		default:
+			close(c.done)
+		}
+	}
 	c.Conn.Close()
 }

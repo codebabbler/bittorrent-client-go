@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sort"
 	"time"
 
 	"github.com/codebabbler/bittorrent-client-go/tracker"
@@ -18,7 +19,7 @@ var DefaultBootstrapNodes = []string{
 }
 
 const (
-	dhtTimeout     = 5 * time.Second
+	dhtTimeout     = 2 * time.Second
 	alpha          = 3  // concurrency parameter
 	maxIterations  = 20 // max rounds of iterative lookup
 )
@@ -53,6 +54,34 @@ func New(port int) (*DHT, error) {
 	}, nil
 }
 
+// readResponseForTransaction reads UDP packets until a response matching txnID is found or timeout is reached.
+func (d *DHT) readResponseForTransaction(txnID string, timeout time.Duration) (*KRPCResponse, *net.UDPAddr, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		now := time.Now()
+		if now.After(deadline) {
+			return nil, nil, fmt.Errorf("timeout waiting for transaction %s", txnID)
+		}
+
+		d.conn.SetReadDeadline(deadline)
+		buf := make([]byte, 4096)
+		n, addr, err := d.conn.ReadFromUDP(buf)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		resp, err := ParseKRPCResponse(buf[:n])
+		if err != nil {
+			// Skip/ignore malformed packets
+			continue
+		}
+
+		if resp.TransactionID == txnID {
+			return resp, addr, nil
+		}
+	}
+}
+
 // Bootstrap contacts the given addresses with find_node queries to populate the routing table.
 func (d *DHT) Bootstrap(addresses []string) error {
 	for _, addr := range addresses {
@@ -71,17 +100,9 @@ func (d *DHT) Bootstrap(addresses []string) error {
 			continue
 		}
 
-		d.conn.SetReadDeadline(time.Now().Add(dhtTimeout))
-		buf := make([]byte, 4096)
-		n, _, err := d.conn.ReadFromUDP(buf)
+		resp, _, err := d.readResponseForTransaction(txnID, dhtTimeout)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "DHT: no response from %s: %v\n", addr, err)
-			continue
-		}
-
-		resp, err := ParseKRPCResponse(buf[:n])
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "DHT: bad response from %s: %v\n", addr, err)
 			continue
 		}
 
@@ -106,23 +127,35 @@ func (d *DHT) Bootstrap(addresses []string) error {
 // GetPeers performs an iterative lookup to find peers for the given info hash.
 func (d *DHT) GetPeers(infoHash [20]byte) ([]tracker.Peer, error) {
 	var allPeers []tracker.Peer
+	target := NodeID(infoHash)
 	queried := make(map[NodeID]bool)
 
-	for iter := 0; iter < maxIterations; iter++ {
-		// Find closest known nodes to info hash
-		target := NodeID(infoHash)
-		closest := d.routingTable.FindClosest(target, alpha)
+	// Keep a list of candidate nodes
+	candidates := d.routingTable.FindClosest(target, 20)
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("no nodes in routing table")
+	}
 
-		if len(closest) == 0 {
-			break
+	for iter := 0; iter < maxIterations; iter++ {
+		// Pick the closest alpha nodes that have not been queried yet
+		var toQuery []Node
+		for _, node := range candidates {
+			if !queried[node.ID] {
+				toQuery = append(toQuery, node)
+				if len(toQuery) == alpha {
+					break
+				}
+			}
 		}
 
-		newResponses := false
-		for _, node := range closest {
-			if queried[node.ID] {
-				continue
-			}
+		if len(toQuery) == 0 {
+			break // all candidates queried
+		}
+
+		newNodesFound := false
+		for _, node := range toQuery {
 			queried[node.ID] = true
+			fmt.Fprintf(os.Stderr, "DHT: querying node %s (%s)...\n", node.ID, node.Addr)
 
 			txnID := GenerateTransactionID()
 			query := BuildGetPeersQuery(txnID, d.nodeID, infoHash)
@@ -132,15 +165,9 @@ func (d *DHT) GetPeers(infoHash [20]byte) ([]tracker.Peer, error) {
 				continue
 			}
 
-			d.conn.SetReadDeadline(time.Now().Add(dhtTimeout))
-			buf := make([]byte, 4096)
-			n, _, err := d.conn.ReadFromUDP(buf)
+			resp, _, err := d.readResponseForTransaction(txnID, dhtTimeout)
 			if err != nil {
-				continue
-			}
-
-			resp, err := ParseKRPCResponse(buf[:n])
-			if err != nil {
+				fmt.Fprintf(os.Stderr, "DHT: query to %s failed: %v\n", node.Addr, err)
 				continue
 			}
 
@@ -149,28 +176,46 @@ func (d *DHT) GetPeers(infoHash [20]byte) ([]tracker.Peer, error) {
 
 			// Got peers!
 			if len(resp.Values) > 0 {
+				peersFound := 0
 				for _, v := range resp.Values {
 					peers := parsePeerValues(v)
 					allPeers = append(allPeers, peers...)
+					peersFound += len(peers)
 				}
+				fmt.Fprintf(os.Stderr, "DHT: node %s returned %d peers\n", node.Addr, peersFound)
 			}
 
-			// Got closer nodes — add to routing table and continue
+			// Got closer nodes — add to candidate list
 			if len(resp.Nodes) > 0 {
 				for _, n := range resp.Nodes {
 					d.routingTable.Add(n)
+
+					// Add to candidates if not already present
+					found := false
+					for _, c := range candidates {
+						if c.ID == n.ID {
+							found = true
+							break
+						}
+					}
+					if !found {
+						candidates = append(candidates, n)
+						newNodesFound = true
+					}
 				}
-				newResponses = true
 			}
 		}
 
-		// If we found peers, return them
-		if len(allPeers) > 0 {
-			return allPeers, nil
+		// Sort candidates by distance to target and keep the closest 20
+		sort.Slice(candidates, func(i, j int) bool {
+			return CompareDistance(target, candidates[i].ID, candidates[j].ID) < 0
+		})
+		if len(candidates) > 20 {
+			candidates = candidates[:20]
 		}
 
-		// If no new nodes were discovered, stop iterating
-		if !newResponses {
+		// If no new nodes were added and we have queried the closest candidates, stop
+		if !newNodesFound && len(toQuery) < alpha {
 			break
 		}
 	}
@@ -178,7 +223,6 @@ func (d *DHT) GetPeers(infoHash [20]byte) ([]tracker.Peer, error) {
 	if len(allPeers) == 0 {
 		return nil, fmt.Errorf("no peers found for info hash")
 	}
-
 	return allPeers, nil
 }
 

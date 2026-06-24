@@ -11,7 +11,7 @@ A full-featured BitTorrent client written from scratch in Go. This client implem
 - **HTTP & UDP Tracker Support**: Communicates with trackers via both HTTP/HTTPS and UDP (`udp://` protocol via BEP 15) to discover active peers.
 - **Peer Wire Protocol**: Full TCP state machine implementation handling handshakes, bitfield transmission, choke/unchoke notifications, interested indicators, and block requests.
 - **Extension Protocol (BEP 10 & BEP 9)**: Supports extension handshakes and metadata exchange to retrieve `.torrent` metadata directly from peers using magnet links.
-- **Concurrent Piece Downloader**: Downloads pieces in parallel across multiple peer connections with worker pools, verifies integrity via piece SHA-1 hashes, and handles both single-file and multi-file torrent layouts.
+- **Concurrent P2P Download Engine**: A `libtorrent`-inspired event-driven downloading architecture featuring rarest-first piece selection, dynamic block request pipelining (up to 8 in-flight requests), keepalives/timeout tracking, request stall cancellations, and an **End-Game Mode** for duplicate request mapping. Includes an endpoint pool with exponential backoff penalties.
 - **Kademlia DHT Peer Discovery (BEP 5)**: Queries the Distributed Hash Table (DHT) to resolve info hashes and find active peers without relying on a tracker.
 - **Seeding Server**: Acts as an active peer by listening on TCP ports, establishing incoming handshakes, advertising available pieces via bitfields, and seeding requested blocks back to the network.
 
@@ -35,12 +35,17 @@ bittorrent-client-go/
 ├── download/
 │   ├── concurrent.go        # Concurrent downloader with worker pool
 │   ├── download.go          # Sequential piece downloading and verification
-│   └── filewriter.go        # Reconstructing flat buffers into single/multi-file layouts
+│   ├── filewriter.go        # Reconstructing flat buffers into single/multi-file layouts
+│   ├── manager.go           # TorrentManager central event loop and decoupled storage thread
+│   ├── picker.go            # Rarest-first PiecePicker and End-Game Mode logic
+│   └── session.go           # Global Session coordinator for peer discovery and dialing loops
 ├── peer/
 │   ├── client.go            # Peer client connection, bitfields, choking state
 │   ├── extension.go         # BEP 10/9 extension message and metadata handlers
 │   ├── handshake.go         # TCP handshake serialization and parsing
-│   └── message.go           # Peer wire message protocol parsing
+│   ├── message.go           # Peer wire message protocol parsing
+│   ├── pipeline.go          # Asynchronous reader/writer and ticker loops
+│   └── pool.go              # Peer endpoint backoff and seed status pool
 ├── seeder/
 │   ├── handler.go           # Seeding handler for incoming peer connections
 │   ├── server.go            # Seeding TCP listener and coordinator
@@ -49,7 +54,7 @@ bittorrent-client-go/
 │   ├── magnet.go            # Magnet link parsing and metadata mapping
 │   └── torrent.go           # Torrent file structure and parsing logic
 ├── tracker/
-│   ├── tracker.go           # HTTP/HTTPS tracker client
+│   ├── tracker.go           # HTTP/HTTPS tracker client with list/compact compatibility
 │   └── udp.go               # UDP tracker client (BEP 15)
 ├── docs/                    # Deep-dive protocol and architectural documentation
 ├── runner.sh                # Helper script to build and run the binary
