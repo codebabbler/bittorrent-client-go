@@ -2,6 +2,7 @@ package torrent
 
 import (
 	"crypto/sha1"
+	"encoding/base32"
 	"encoding/hex"
 	"fmt"
 	"net/url"
@@ -31,11 +32,29 @@ func ParseMagnet(uri string) (*MagnetLink, error) {
 		return nil, fmt.Errorf("missing xt parameter")
 	}
 
-	infoHashHex := strings.ToLower(xt[len("urn:btih:"):])
-	infoHash, err := hex.DecodeString(infoHashHex)
-	if err != nil {
-		return nil, fmt.Errorf("decoding info hash: %w", err)
+	if !strings.HasPrefix(strings.ToLower(xt), "urn:btih:") {
+		return nil, fmt.Errorf("unsupported or missing magnet hash format: must start with urn:btih:")
 	}
+
+	hashStr := xt[len("urn:btih:"):]
+	var infoHash []byte
+
+	switch len(hashStr) {
+	case 40: // Base16 (Hex)
+		infoHash, err = hex.DecodeString(hashStr)
+		if err != nil {
+			return nil, fmt.Errorf("decoding hex info hash: %w", err)
+		}
+	case 32: // Base32
+		infoHash, err = base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(strings.ToUpper(hashStr))
+		if err != nil {
+			return nil, fmt.Errorf("decoding base32 info hash: %w", err)
+		}
+	default:
+		return nil, fmt.Errorf("invalid info hash length: %d (expected 32 or 40)", len(hashStr))
+	}
+
+	infoHashHex := hex.EncodeToString(infoHash)
 
 	trackers := parsedUrl.Query()["tr"]
 	var primaryTracker string
