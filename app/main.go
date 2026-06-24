@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 
@@ -195,6 +196,12 @@ func main() {
 		targetOutput := outputPath
 		if tf.IsMultiFile {
 			targetOutput = outputPath + ".tmp"
+		} else {
+			info, err := os.Stat(outputPath)
+			if err == nil && info.IsDir() {
+				outputPath = filepath.Join(outputPath, tf.Name)
+				targetOutput = outputPath
+			}
 		}
 
 		sess := download.NewSession(30, 15)
@@ -444,6 +451,12 @@ func main() {
 		targetOutput := outputPath
 		if tf.IsMultiFile {
 			targetOutput = outputPath + ".tmp"
+		} else {
+			info, err := os.Stat(outputPath)
+			if err == nil && info.IsDir() {
+				outputPath = filepath.Join(outputPath, tf.Name)
+				targetOutput = outputPath
+			}
 		}
 
 		sess := download.NewSession(30, 15)

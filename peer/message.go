@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 )
 
 // Message ID constants
@@ -21,29 +22,56 @@ const (
 	MsgExtension     uint8 = 20
 )
 
-// ReadMessage reads a length-prefixed message from the connection.
-// Returns the message ID and payload (excluding the ID byte).
-// For keepalives (length=0), returns id=0, nil payload, nil error with keepalive=true.
-func ReadMessage(conn net.Conn) (id uint8, payload []byte, err error) {
-	lengthBuf := make([]byte, 4)
-	_, err = io.ReadFull(conn, lengthBuf)
+// MessageBufferPool pools byte slice pointers of size 17000 to hold blocks + headers.
+var MessageBufferPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 17000)
+		return &b
+	},
+}
+
+// readMessage is an optimized unexported function that uses the buffer pool to avoid allocations.
+func readMessage(conn net.Conn) (id uint8, payload []byte, pBuf *[]byte, err error) {
+	var lengthBuf [4]byte
+	_, err = io.ReadFull(conn, lengthBuf[:])
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 
-	msgLen := binary.BigEndian.Uint32(lengthBuf)
+	msgLen := binary.BigEndian.Uint32(lengthBuf[:])
 	if msgLen == 0 {
-		// keepalive — return a sentinel
-		return 0, nil, nil
+		return 0, nil, nil, nil
 	}
 
-	msgBuf := make([]byte, msgLen)
+	var msgBuf []byte
+	if msgLen <= 17000 {
+		pBuf = MessageBufferPool.Get().(*[]byte)
+		msgBuf = (*pBuf)[:msgLen]
+	} else {
+		msgBuf = make([]byte, msgLen)
+	}
+
 	_, err = io.ReadFull(conn, msgBuf)
 	if err != nil {
-		return 0, nil, err
+		if pBuf != nil {
+			MessageBufferPool.Put(pBuf)
+		}
+		return 0, nil, nil, err
 	}
 
-	return msgBuf[0], msgBuf[1:], nil
+	return msgBuf[0], msgBuf[1:], pBuf, nil
+}
+
+// ReadMessage reads a length-prefixed message from the connection.
+// Returns the message ID and payload (excluding the ID byte).
+// For keepalives (length=0), returns id=0, nil payload, nil error.
+func ReadMessage(conn net.Conn) (id uint8, payload []byte, err error) {
+	id, payload, pBuf, err := readMessage(conn)
+	if err == nil && pBuf != nil {
+		// Handshake/initial callers of ReadMessage don't recycle buffers.
+		// That is fine, they will be GC'ed normally. We don't recycle them here.
+	}
+	return id, payload, err
 }
 
 // WriteMessage writes a length-prefixed message to the connection.

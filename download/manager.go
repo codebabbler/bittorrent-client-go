@@ -12,6 +12,11 @@ import (
 	"github.com/codebabbler/bittorrent-client-go/peer"
 )
 
+type BlockBuffer struct {
+	Data []byte
+	PBuf *[]byte
+}
+
 type PieceWrite struct {
 	Index int
 	Data  []byte
@@ -35,7 +40,7 @@ type TorrentManager struct {
 	errCh        chan error
 
 	// Buffers for incomplete pieces: pieceIndex -> blockOffset -> blockData
-	pieceBufs    map[int]map[int][]byte
+	pieceBufs    map[int]map[int]BlockBuffer
 	pieceBufsMu  sync.Mutex
 
 	OnPeerDisconnect func(peerAddr string)
@@ -56,7 +61,7 @@ func NewTorrentManager(infoHash []byte, pieces string, length, pieceLength int, 
 		storageCh:   make(chan PieceWrite, 64),
 		doneCh:      make(chan struct{}),
 		errCh:       make(chan error, 1),
-		pieceBufs:   make(map[int]map[int][]byte),
+		pieceBufs:   make(map[int]map[int]BlockBuffer),
 	}
 }
 
@@ -133,6 +138,9 @@ func (tm *TorrentManager) Start() error {
 			tm.pipelineRequests()
 		case msg := <-tm.InMessages:
 			tm.handleMessage(msg)
+			if msg.ID != peer.MsgPiece && msg.PBuf != nil {
+				peer.MessageBufferPool.Put(msg.PBuf)
+			}
 			tm.pipelineRequests()
 		}
 	}
@@ -173,9 +181,9 @@ func (tm *TorrentManager) handleMessage(msg peer.PeerMessage) {
 
 		tm.pieceBufsMu.Lock()
 		if _, ok := tm.pieceBufs[index]; !ok {
-			tm.pieceBufs[index] = make(map[int][]byte)
+			tm.pieceBufs[index] = make(map[int]BlockBuffer)
 		}
-		tm.pieceBufs[index][begin] = blockData
+		tm.pieceBufs[index][begin] = BlockBuffer{Data: blockData, PBuf: msg.PBuf}
 		tm.pieceBufsMu.Unlock()
 
 		_, pieceDone, torrentDone := tm.Picker.MarkCompleted(index, begin, msg.PeerAddress)
@@ -209,13 +217,16 @@ func (tm *TorrentManager) verifyAndWritePiece(index int) {
 
 	for b := 0; b < numBlocks; b++ {
 		begin := b * blockSize
-		blockBytes, ok := blocks[begin]
+		blockBuf, ok := blocks[begin]
 		if !ok {
 			// Incomplete piece, mark failed
 			tm.revertPiece(index)
 			return
 		}
-		copy(pieceData[begin:], blockBytes)
+		copy(pieceData[begin:], blockBuf.Data)
+		if blockBuf.PBuf != nil {
+			peer.MessageBufferPool.Put(blockBuf.PBuf)
+		}
 	}
 
 	// Verify SHA-1 hash
@@ -239,7 +250,15 @@ func (tm *TorrentManager) verifyAndWritePiece(index int) {
 
 func (tm *TorrentManager) revertPiece(index int) {
 	tm.pieceBufsMu.Lock()
-	delete(tm.pieceBufs, index)
+	blocks, ok := tm.pieceBufs[index]
+	if ok {
+		for _, blockBuf := range blocks {
+			if blockBuf.PBuf != nil {
+				peer.MessageBufferPool.Put(blockBuf.PBuf)
+			}
+		}
+		delete(tm.pieceBufs, index)
+	}
 	tm.pieceBufsMu.Unlock()
 
 	pieceLen := tm.PieceLength

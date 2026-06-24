@@ -20,6 +20,7 @@ type PeerMessage struct {
 	PeerAddress string
 	ID          uint8  // 0xFF = error / disconnection, 0xFE = block timeout
 	Payload     []byte
+	PBuf        *[]byte // Pointer to buffer for sync.Pool recycling
 }
 
 // StartLoop initializes and starts the async reader, writer, and ticker loops.
@@ -51,7 +52,7 @@ func (c *Client) StartLoop(msgChan chan<- PeerMessage) {
 func (c *Client) readLoop(msgChan chan<- PeerMessage) {
 	defer c.Close()
 	for {
-		id, payload, err := ReadMessage(c.Conn)
+		id, payload, pBuf, err := readMessage(c.Conn)
 		if err != nil {
 			select {
 			case msgChan <- PeerMessage{PeerAddress: c.Address, ID: 0xFF, Payload: []byte(err.Error())}:
@@ -90,8 +91,11 @@ func (c *Client) readLoop(msgChan chan<- PeerMessage) {
 		}
 
 		select {
-		case msgChan <- PeerMessage{PeerAddress: c.Address, ID: id, Payload: payload}:
+		case msgChan <- PeerMessage{PeerAddress: c.Address, ID: id, Payload: payload, PBuf: pBuf}:
 		case <-c.done:
+			if pBuf != nil {
+				MessageBufferPool.Put(pBuf)
+			}
 			return
 		}
 	}

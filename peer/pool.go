@@ -103,16 +103,9 @@ func (p *PeerEndpointPool) GetCandidates(excludeSeeds bool) []string {
 	return candidates
 }
 
-// EvictDead removes endpoints that have failed too many times.
+// EvictDead is a no-op to retain blacklisted endpoints (FailCount >= 5)
+// and prevent them from being re-added by subsequent tracker discoveries.
 func (p *PeerEndpointPool) EvictDead() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	for addr, ep := range p.endpoints {
-		if ep.FailCount >= 5 {
-			delete(p.endpoints, addr)
-		}
-	}
 }
 
 // Size returns the total number of endpoints in the pool.
