@@ -634,14 +634,15 @@ func connectToWorkingPeer(peers []tracker.Peer, infoHash []byte, setupExtensions
 	}
 
 	resultChan := make(chan *peer.Client, 1)
-	errChan := make(chan error, len(peers))
 	done := make(chan struct{})
-	defer close(done)
 
-	// Limit concurrency to 15 parallel dialing goroutines
-	sem := make(chan struct{}, 15)
+	var mu sync.Mutex
+	var completed bool
 
 	var wg sync.WaitGroup
+	// Limit concurrency to 30 parallel dialing goroutines
+	sem := make(chan struct{}, 30)
+
 	for _, p := range peers {
 		wg.Add(1)
 		go func(peerAddr string) {
@@ -654,14 +655,16 @@ func connectToWorkingPeer(peers []tracker.Peer, infoHash []byte, setupExtensions
 			}
 			defer func() { <-sem }()
 
+			select {
+			case <-done:
+				return
+			default:
+			}
+
 			fmt.Fprintf(os.Stderr, "Trying to connect to peer %s...\n", peerAddr)
 			client, err := peer.NewClient(peerAddr, infoHash, setupExtensions)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Failed to connect to peer %s: %v\n", peerAddr, err)
-				select {
-				case errChan <- err:
-				case <-done:
-				}
 				return
 			}
 
@@ -670,41 +673,31 @@ func connectToWorkingPeer(peers []tracker.Peer, infoHash []byte, setupExtensions
 				if err != nil {
 					client.Close()
 					fmt.Fprintf(os.Stderr, "Failed extension handshake with peer %s: %v\n", peerAddr, err)
-					select {
-					case errChan <- err:
-					case <-done:
-					}
 					return
 				}
 			}
 
-			// Successfully connected and completed handshakes!
-			select {
-			case resultChan <- client:
-			case <-done:
+			mu.Lock()
+			if !completed {
+				completed = true
+				close(done) // cancel all other dials immediately
+				resultChan <- client
+			} else {
 				client.Close()
 			}
+			mu.Unlock()
 		}(p.Address())
 	}
 
-	// Close errChan when all dialers finish
+	// Close resultChan when all dialers finish so we don't block forever if all fail
 	go func() {
 		wg.Wait()
-		close(errChan)
+		close(resultChan)
 	}()
 
-	select {
-	case client := <-resultChan:
+	client, ok := <-resultChan
+	if ok && client != nil {
 		return client, nil
-	case <-errChan:
-		// Collect errors if all failed
-		var lastErr error
-		for err := range errChan {
-			lastErr = err
-		}
-		if lastErr != nil {
-			return nil, fmt.Errorf("failed to connect/setup extensions with any peer: %w", lastErr)
-		}
 	}
 
 	return nil, fmt.Errorf("failed to connect to any peer")

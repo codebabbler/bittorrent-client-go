@@ -36,7 +36,7 @@ func (c *Client) DoExtensionHandshake() (int, error) {
 		if payload == nil {
 			continue // keepalive
 		}
-		if id == MsgExtension {
+		if id == MsgExtension && len(payload) > 1 && payload[0] == 0 {
 			// payload[0] = ext msg id (0 = handshake), payload[1:] = bencoded dict
 			dictStr := string(payload[1:])
 			pos := 0

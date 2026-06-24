@@ -103,20 +103,19 @@ func NewClient(address string, infoHash []byte, extensions bool) (*Client, error
 
 		if id == MsgBitfield {
 			// Consume bitfield (we don't store it)
-		} else {
-			if id == MsgExtension && len(payload) > 1 && payload[0] == 0 {
-				dictStr := string(payload[1:])
-				pos := 0
-				extDict, _, err := bencode.DecodeDict(dictStr, &pos)
-				if err == nil {
-					if mDict, ok := extDict["m"].(map[string]interface{}); ok {
-						if peerExtId, ok := mDict["ut_metadata"].(int); ok {
-							client.PeerMetadataExtId = peerExtId
-						}
+		} else if id == MsgExtension && len(payload) > 1 && payload[0] == 0 {
+			dictStr := string(payload[1:])
+			pos := 0
+			extDict, _, err := bencode.DecodeDict(dictStr, &pos)
+			if err == nil {
+				if mDict, ok := extDict["m"].(map[string]interface{}); ok {
+					if peerExtId, ok := mDict["ut_metadata"].(int); ok {
+						client.PeerMetadataExtId = peerExtId
 					}
 				}
 			}
-			// Buffer other messages (e.g. MsgExtension)
+		} else {
+			// Buffer other messages (e.g. MsgExtension data/reject)
 			client.bufferedMsgs = append(client.bufferedMsgs, bufferedMsg{id: id, payload: payload})
 		}
 	}
